@@ -3,7 +3,138 @@ use crate::Host;
 use ide_core::remote_settings::RunTargetKind;
 use ide_core::{IdeError, IdeResult, RunId};
 use ide_run::{OutputChunk, RunConfig, RunInfo, StartOptions};
+use std::collections::{HashMap, VecDeque};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// Bounded console output of the runs this process started, for
+/// [`output_tail`] (agents read logs without the UI's streaming channel).
+/// Capped in chunks per run and in runs kept, so it cannot grow unbounded.
+const OUTPUT_CHUNKS_PER_RUN: usize = 1000;
+const OUTPUT_RUNS_KEPT: usize = 256;
+
+fn run_outputs() -> &'static parking_lot::RwLock<HashMap<RunId, Arc<parking_lot::Mutex<VecDeque<OutputChunk>>>>> {
+    static RUN_OUTPUTS: OnceLock<parking_lot::RwLock<HashMap<RunId, Arc<parking_lot::Mutex<VecDeque<OutputChunk>>>>>> =
+        OnceLock::new();
+    RUN_OUTPUTS.get_or_init(Default::default)
+}
+
+/// Wraps `on_output` so the chunks of the started run are also captured:
+/// into the in-memory ring buffer and, when given, the run's shared log file.
+fn tracked_output(
+    on_output: Emit<OutputChunk>,
+    log: Option<PathBuf>,
+) -> (Emit<OutputChunk>, Arc<parking_lot::Mutex<VecDeque<OutputChunk>>>) {
+    let buffer: Arc<parking_lot::Mutex<VecDeque<OutputChunk>>> = Arc::default();
+    let store = buffer.clone();
+    let file = log.and_then(|path| {
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(std::sync::Mutex::new)
+    });
+    (
+        Arc::new(move |chunk: OutputChunk| {
+            let mut chunks = store.lock();
+            if chunks.len() >= OUTPUT_CHUNKS_PER_RUN {
+                chunks.pop_front();
+            }
+            chunks.push_back(chunk.clone());
+            drop(chunks);
+            if let Some(file) = &file
+                && let Ok(mut file) = file.lock()
+            {
+                let _ = file.write_all(chunk_text(&chunk).as_bytes());
+            }
+            on_output(chunk);
+        }),
+        buffer,
+    )
+}
+
+fn remember_run_output(id: RunId, buffer: &Arc<parking_lot::Mutex<VecDeque<OutputChunk>>>) {
+    let mut runs = run_outputs().write();
+    if runs.len() >= OUTPUT_RUNS_KEPT
+        && let Some(oldest) = runs.keys().min().copied()
+    {
+        runs.remove(&oldest);
+    }
+    runs.insert(id, buffer.clone());
+}
+
+/// The last `n` chunks of console output of run `id`, as captured since this
+/// process started it (see [`start`]); empty for runs it does not know.
+pub fn output_tail(id: RunId, n: usize) -> Vec<OutputChunk> {
+    let buffer = run_outputs().read().get(&id).cloned();
+    let Some(buffer) = buffer else { return Vec::new() };
+    let chunks = buffer.lock();
+    let skip = chunks.len().saturating_sub(n.max(1));
+    chunks.iter().skip(skip).cloned().collect()
+}
+
+/// Console output of runs logged for readers in other processes (the MCP
+/// server reads the GUI's runs here): one `<RunId>.log` per run in
+/// `local_data_dir/run-logs`, indexed by [`RUN_LOG_MANIFEST`].
+pub const RUN_LOG_MANIFEST: &str = "runs.jsonl";
+const RUN_LOG_KEEP_DAYS: u64 = 7;
+
+/// The directory holding the shared run logs.
+pub fn run_logs_dir(host: &Host) -> PathBuf {
+    host.local_data_dir.join("run-logs")
+}
+
+static PENDING_LOG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Creates the shared log directory, prunes expired logs, and returns this
+/// run's pending log path (renamed to `<RunId>.log` once the run is known).
+fn pending_run_log(host: &Host) -> PathBuf {
+    let dir = run_logs_dir(host);
+    let _ = std::fs::create_dir_all(&dir);
+    let cutoff = std::time::SystemTime::now() - Duration::from_secs(RUN_LOG_KEEP_DAYS * 24 * 3600);
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "log")
+            && entry.metadata().is_ok_and(|m| m.modified().is_ok_and(|m| m < cutoff))
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    dir.join(format!("pending-{}-{}.log", std::process::id(), PENDING_LOG_SEQ.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn chunk_text(chunk: &OutputChunk) -> &str {
+    match chunk {
+        OutputChunk::Stdout { text } | OutputChunk::Stderr { text } | OutputChunk::System { text } => text,
+    }
+}
+
+/// Renames the pending log to `<RunId>.log` and appends the manifest line
+/// other processes correlate `configId`s with. Best-effort: the shared logs
+/// are an extra, the UI streaming is unaffected.
+fn finalize_run_log(host: &Host, id: RunId, config: &RunConfig, root: &Path, pending: &Path) {
+    let dir = run_logs_dir(host);
+    let final_path = dir.join(format!("{}.log", id.0));
+    if std::fs::rename(pending, &final_path).is_err() {
+        return;
+    }
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let line = format!(
+        "{}\n",
+        serde_json::json!({
+            "runId": id.0,
+            "configId": config.id,
+            "configName": config.name,
+            "root": root.to_string_lossy(),
+            "startedMs": started_ms,
+        })
+    );
+    if let Ok(mut manifest) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(RUN_LOG_MANIFEST)) {
+        let _ = manifest.write_all(line.as_bytes());
+    }
+}
 
 /// Detected configs followed by user-defined ones (user ids win on conflict).
 pub fn configs(host: &Host, window: &str) -> IdeResult<Vec<RunConfig>> {
@@ -193,6 +324,8 @@ pub fn apply_settings(host: &Host, window: &str, configs: Vec<RunConfig>) -> Ide
 }
 
 pub async fn start(host: &Host, window: &str, config: RunConfig, on_output: Emit<OutputChunk>) -> IdeResult<RunInfo> {
+    let pending_log = pending_run_log(host);
+    let (on_output, output_buffer) = tracked_output(on_output, Some(pending_log.clone()));
     host.require_trust(window)?;
     let project = host.project(window)?;
     if config.command.is_empty() {
@@ -217,19 +350,26 @@ pub async fn start(host: &Host, window: &str, config: RunConfig, on_output: Emit
                 ruby_reporter: None,
             };
             project.require_trust()?;
-            return host.processes.start(
+            let out = on_output.clone();
+            let started = host.processes.start(
                 &project.root,
                 &config,
                 &options,
                 project.sink.clone(),
-                Box::new(move |c| on_output(c)),
-            );
+                Box::new(move |c| out(c)),
+            )?;
+            remember_run_output(started.id, &output_buffer);
+            finalize_run_log(host, started.id, &config, &project.root, &pending_log);
+            return Ok(started);
         }
         let out = on_output.clone();
-        return host
-            .remote
-            .run(&settings, &project.root, &config, project.sink.clone(), Box::new(move |c| out(c)))
-            .await;
+        let started =
+            host.remote.run(&settings, &project.root, &config, project.sink.clone(), Box::new(move |c| out(c))).await;
+        if let Ok(info) = &started {
+            remember_run_output(info.id, &output_buffer);
+            finalize_run_log(host, info.id, &config, &project.root, &pending_log);
+        }
+        return started;
     }
     let mut config = config;
     let (root, settings) = settings_for(host, &project, &mut config)?;
@@ -291,7 +431,11 @@ pub async fn start(host: &Host, window: &str, config: RunConfig, on_output: Emit
             previous.emit(event);
         });
     }
-    host.processes.start(&project.root, &config, &options, sink, Box::new(move |c| on_output(c)))
+    let out = on_output.clone();
+    let started = host.processes.start(&project.root, &config, &options, sink, Box::new(move |c| out(c)))?;
+    remember_run_output(started.id, &output_buffer);
+    finalize_run_log(host, started.id, &config, &project.root, &pending_log);
+    Ok(started)
 }
 
 /// The Ruby test reporter's directory, installed on demand, for runs that take it.

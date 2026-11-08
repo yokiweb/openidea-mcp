@@ -65,6 +65,11 @@ pub fn export_bindings(builder: &tauri_specta::Builder<tauri::Wry>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // MCP server mode: serve the project's run configurations and data sources
+    // over stdio, before logging / single-instance / Tauri start; no UI.
+    if let Some(code) = ide_mcp::try_main() {
+        std::process::exit(code);
+    }
     ide_workspace::process::mark_start();
     let context = tauri::generate_context!();
     #[cfg(debug_assertions)]

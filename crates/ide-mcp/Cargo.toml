@@ -1,0 +1,25 @@
+[package]
+name = "ide-mcp"
+description = "The IDE's MCP server: AI agents manage run configurations and query data sources over stdio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ide-core.workspace = true
+ide-db.workspace = true
+ide-host.workspace = true
+ide-language.workspace = true
+ide-run.workspace = true
+ide-sdk.workspace = true
+ide-tools = { path = "../ide-tools" }
+dirs.workspace = true
+axum.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "net"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
