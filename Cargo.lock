@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "ide-mcp"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "axum",
  "dirs 6.0.0",
