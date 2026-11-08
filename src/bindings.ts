@@ -341,6 +341,13 @@ export const commands = {
 } | null) => typedError<null, IdeError>(__TAURI_INVOKE("caches_schedule_invalidation", { options })),
 	/**  Quits through every window's unsaved-changes check, then starts again. */
 	appRestart: () => __TAURI_INVOKE<void>("app_restart"),
+	mcpServerStatus: () => typedError<McpServerStatus, IdeError>(__TAURI_INVOKE("mcp_server_status")),
+	/**
+	 *  Saves `enabled` / `port` / `allow_write` and applies them: starts the server
+	 *  on the calling window's project, or stops it. Restarts when the address or
+	 *  the project changes while it runs.
+	 */
+	mcpServerApply: (enabled: boolean, port: number, allowWrite: boolean) => typedError<McpServerStatus, IdeError>(__TAURI_INVOKE("mcp_server_apply", { enabled, port, allowWrite })),
 	indexStatus: () => typedError<IndexStatus, IdeError>(__TAURI_INVOKE("index_status")),
 	indexFileExtensions: () => typedError<ExtensionCount[], IdeError>(__TAURI_INVOKE("index_file_extensions")),
 	/**  Spring Web mapping sources for the request-path index of Search Everywhere. */
@@ -5424,6 +5431,26 @@ export type MavenSettings = {
 	 *  multiplier (`2C`, `2.5C`); empty = Maven's default (one thread per module).
 	 */
 	threads?: string,
+};
+
+/**  What the settings page shows: the saved configuration plus live state. */
+export type McpServerStatus = {
+	/**  Saved switch: start the server on the next Apply of this page's scope. */
+	enabled: boolean,
+	running: boolean,
+	port: number,
+	allowWrite: boolean,
+	/**
+	 *  Bearer token MCP clients must send; regenerated never (a stable one keeps
+	 *  client configurations valid across restarts).
+	 */
+	token: string,
+	/**  The root of the project the running server serves. */
+	project: string | null,
+	/**  Why the last start failed, until the next attempt. */
+	error: string | null,
+	/**  `[exe, "--mcp", "--project", <root>]`: the stdio client configuration. */
+	stdioCommand: string[],
 };
 
 export type MemoryCategory = 

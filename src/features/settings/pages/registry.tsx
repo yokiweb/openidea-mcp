@@ -7,6 +7,7 @@ import { DEPLOYMENT_PAGES } from "./deployment";
 import { EDITOR_PAGES, codeStyleLanguagePages } from "./editor";
 import { EXECUTION_PAGES } from "./execution";
 import { LANGUAGE_PAGES } from "./languages";
+import { MCP_PAGES } from "./mcp";
 import { OptionsPage } from "./OptionsPage";
 import { RUN_TARGET_PAGES } from "./runTargets";
 import { specLabels, type PageSpec } from "./spec";
@@ -23,6 +24,7 @@ const BUILTIN_PAGES = [
   ...DEPLOYMENT_PAGES,
   ...RUN_TARGET_PAGES,
   ...TOOLS_PAGES,
+  ...MCP_PAGES,
   ...SSH_PAGES,
   ...LANGUAGE_PAGES,
 ];

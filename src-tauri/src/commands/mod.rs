@@ -29,6 +29,7 @@ pub mod history;
 pub mod http;
 pub mod java;
 pub mod lsp;
+pub mod mcp;
 pub mod nav;
 pub mod notebook;
 pub mod perf;
@@ -194,6 +195,8 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         refactor::refactor_can_undo_file_move,
         caches::caches_schedule_invalidation,
         caches::app_restart,
+        mcp::mcp_server_status,
+        mcp::mcp_server_apply,
         nav::index_status,
         nav::index_file_extensions,
         nav::spring_route_sources,
