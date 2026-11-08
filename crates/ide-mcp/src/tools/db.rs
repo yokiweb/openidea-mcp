@@ -64,8 +64,9 @@ pub async fn execute_query(
     }
     guard::check(&statements, allow_write)?;
     let max_rows = max_rows.unwrap_or(200).clamp(1, 1000);
+    // 上游 execute 新增 schema 上下文；MCP 没有 console 的活动 schema，传 None 表示不切换。
     let outcomes =
-        ide_host::ops::db::execute(host, window, RequestId::next(), &source.id, statements, 0, max_rows)
+        ide_host::ops::db::execute(host, window, RequestId::next(), &source.id, statements, 0, max_rows, None)
             .await
             .map_err(err)?;
     let mut results = Vec::new();
