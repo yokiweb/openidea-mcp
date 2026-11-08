@@ -1,6 +1,7 @@
 import { copySelectionOnKeyDown } from "@/ui/selectableText";
 import {
   memo,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -14,10 +15,13 @@ import clsx from "clsx";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useWorkflowSettings } from "@/platform/workflowSettings";
 import { Icon, showContextMenu } from "@/ui";
-import { spanStyle } from "@/ui/ansi";
+import { spanStyle, type Span, type SpanStyle } from "@/ui/ansi";
 import ansi from "@/ui/ansi.module.css";
 import type { ConsoleLine, ConsoleModel } from "./console";
 import { findOutputLinks, type OutputLink } from "./links";
+import { parseMybatisLog } from "./mybatis";
+import { MybatisIndex, type MybatisMark } from "./mybatisIndex";
+import { openMybatisSql } from "./mybatisTarget";
 import { openTarget, openUrl } from "./navigate";
 import { segmentLine, type SegmentMark } from "./segments";
 import styles from "./Run.module.css";
@@ -32,24 +36,70 @@ const ROW = 20;
 const MARK_COLOR = "var(--bg-search-match)";
 const CURRENT_MARK_COLOR = "var(--bg-search-match-current)";
 
+/** MyBatis SQL is coloured with the SQL editor's own scheme (`SqlHighlight`). */
+const TOKEN_STYLE: Record<string, SpanStyle> = {
+  keyword: { fg: "var(--syn-keyword)", bold: true },
+  string: { fg: "var(--syn-string)" },
+  number: { fg: "var(--syn-number)" },
+  comment: { fg: "var(--fg-muted)", italic: true },
+};
+
+/** The line's spans, with a MyBatis statement's keywords coloured in place. */
+function spansOf(line: ConsoleLine, mark: MybatisMark | undefined): readonly Span[] {
+  const tokens = mark?.tokens;
+  if (!tokens?.length) return line.spans;
+  const out: Span[] = [];
+  let pos = 0;
+  for (const span of line.spans) {
+    const end = pos + span.text.length;
+    let at = pos;
+    for (const [from, to, kind] of tokens) {
+      if (to <= at || from >= end) continue;
+      const start = Math.max(from, at);
+      const stop = Math.min(to, end);
+      if (start > at) out.push({ ...span, text: line.text.slice(at, start) });
+      out.push({ ...span, ...TOKEN_STYLE[kind], text: line.text.slice(start, stop) });
+      at = stop;
+    }
+    if (at < end) out.push({ ...span, text: line.text.slice(at, end) });
+    pos = end;
+  }
+  return out;
+}
+
+/** A `Parameters:` value is a click that restores the statement, as the plugins do. */
+function withMybatisLink(links: OutputLink[], mark: MybatisMark | undefined, length: number): OutputLink[] {
+  if (mark?.role !== "params") return links;
+  const start = mark.paramsAt ?? 0;
+  // A value that merely looks like a path is part of the clickable parameter list.
+  const kept = links.filter((link) => link.end <= start);
+  return [...kept, { kind: "mybatis", start, end: length, entryId: mark.entryId }];
+}
+
 const Line = memo(
   function Line({
     line,
     marks,
     cwd,
+    mark,
+    onMybatis,
   }: {
     line: ConsoleLine;
     marks?: readonly SegmentMark[];
     length: number;
     cwd: string;
+    mark?: MybatisMark;
+    onMybatis: (entryId: number, at: MouseEvent) => void;
   }) {
     // Not memoised: the open (last) line mutates in place; `memo` below re-renders on length changes only.
-    const segments = segmentLine(line.spans, line.kind === "system" ? [] : findOutputLinks(line.text), marks);
+    const links = line.kind === "system" ? [] : withMybatisLink(findOutputLinks(line.text), mark, line.text.length);
+    const segments = segmentLine(spansOf(line, mark), links, marks);
     const activate = (e: MouseEvent, link: OutputLink) => {
       e.preventDefault();
       if (window.getSelection()?.toString()) return;
       if (link.kind === "url") void openUrl(link.url);
-      else void openTarget(link.target, cwd);
+      else if (link.kind === "file") void openTarget(link.target, cwd);
+      else onMybatis(link.entryId, e);
     };
     if (segments.length === 0) return <>{"​"}</>;
     return (
@@ -90,7 +140,13 @@ const Line = memo(
       </>
     );
   },
-  (a, b) => a.line === b.line && a.length === b.length && a.cwd === b.cwd && a.marks === b.marks,
+  (a, b) =>
+    a.line === b.line &&
+    a.length === b.length &&
+    a.cwd === b.cwd &&
+    a.marks === b.marks &&
+    a.mark === b.mark &&
+    a.onMybatis === b.onMybatis,
 );
 
 /** A run of folded lines (Settings › Console › Fold lines that contain). */
@@ -182,6 +238,15 @@ export function ConsoleView({
   const innerRef = useRef<HTMLDivElement>(null);
   const lines = model.lines;
   const patterns = useWorkflowSettings((s) => s.console.foldPatterns);
+  const mybatis = useRef<MybatisIndex | null>(null);
+  const statements = (mybatis.current ??= new MybatisIndex());
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `version` marks in-place appends to `lines`
+  useMemo(() => statements.update(lines), [statements, lines, version]);
+  /** A `Parameters:` click restores the statement into a query console. */
+  const restoreSql = useCallback((entryId: number, at: MouseEvent) => {
+    const entry = mybatis.current?.entry(entryId);
+    if (entry) void openMybatisSql(entry.sql, at);
+  }, []);
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
   const [internalFindOpen, setInternalFindOpen] = useState(false);
   const findOpen = controlledFindOpen ?? internalFindOpen;
@@ -402,6 +467,8 @@ export function ConsoleView({
   const onContextMenu = (e: MouseEvent) => {
     e.preventDefault();
     const selection = selectedOutput();
+    // Selected MyBatis log (Preparing:/Parameters:) copies back as executable SQL.
+    const restored = selection ? parseMybatisLog([{ id: 0, text: selection }]) : [];
     showContextMenu(e, [
       {
         label: "Copy",
@@ -412,6 +479,18 @@ export function ConsoleView({
       },
       { label: "Select All", shortcut: formatBinding(hostBinding("Meta+A")), run: selectAll },
       { label: "Copy All", run: () => void navigator.clipboard?.writeText(model.text()).catch(() => undefined) },
+      ...(restored.length
+        ? [
+            {
+              label: "Copy Restored SQL",
+              icon: "database",
+              run: () =>
+                void navigator.clipboard
+                  ?.writeText(restored.map((r, i) => `-- ${i + 1}\n${r.sql};`).join("\n"))
+                  .catch(() => undefined),
+            },
+          ]
+        : []),
       {
         label: "Find…",
         icon: "search",
@@ -572,7 +651,14 @@ export function ConsoleView({
                 className={clsx(styles.line, styles[line.kind])}
                 style={{ transform: `translateY(${item.start}px)`, height: softWrap ? undefined : ROW }}
               >
-                <Line line={line} marks={marksByLine.get(row.index)} length={line.text.length} cwd={cwd} />
+                <Line
+                  line={line}
+                  marks={marksByLine.get(row.index)}
+                  length={line.text.length}
+                  cwd={cwd}
+                  mark={statements.mark(line.id)}
+                  onMybatis={restoreSql}
+                />
                 {row.fold && foldButton(row.fold, true)}
                 {inputInline && item.index === rows.length - 1 && pendingInput}
                 {"\n"}

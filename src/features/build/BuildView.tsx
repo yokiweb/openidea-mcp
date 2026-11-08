@@ -216,7 +216,7 @@ function ConsoleLineText({ line, root }: { line: ConsoleLine; root: string }) {
     e.preventDefault();
     if (window.getSelection()?.toString()) return;
     if (link.kind === "url") void openUrl(link.url);
-    else void openTarget(link.target, line.cwd ?? root);
+    else if (link.kind === "file") void openTarget(link.target, line.cwd ?? root);
   };
   if (!links.length) return <>{line.text}</>;
   const out: ReactNode[] = [];

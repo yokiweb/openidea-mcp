@@ -38,7 +38,9 @@ export function jvmFrameTarget(className: string | undefined, file: string, line
 
 export type OutputLink =
   | { kind: "url"; start: number; end: number; url: string }
-  | { kind: "file"; start: number; end: number; target: FileTarget };
+  | { kind: "file"; start: number; end: number; target: FileTarget }
+  /** A MyBatis `Parameters:` value: its statement, restored, opens in a query console. */
+  | { kind: "mybatis"; start: number; end: number; entryId: number };
 
 interface Pattern {
   re: RegExp;
