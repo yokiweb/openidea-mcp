@@ -124,10 +124,21 @@ fn stop() {
     }
 }
 
+/// 记录一次启动失败但让设置页保留表单：返回 Ok(status)，错误由 Status 行显示。
+/// 直接 `?` 抛给前端会让整页退回 fallback，把「没有打开项目」误显示成
+/// 「构建太旧 / 缺少 TypeScript 绑定」。
+fn soft_fail(state: &AppState, label: &str, message: String) -> IdeResult<McpServerStatus> {
+    *LAST_ERROR.lock() = Some(message);
+    Ok(status(state, label))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn mcp_server_status(window: Window, state: State<'_, AppState>) -> IdeResult<McpServerStatus> {
-    Ok(status(&state, window.label()))
+    // 设置页可能开在独立的 settings 窗口；与 apply 用同一个 owner 映射，
+    // 否则这里显示的项目与开关实际服务的项目会不一致。
+    let label = AppState::owner_window(window.label()).to_owned();
+    Ok(status(&state, &label))
 }
 
 /// Saves `enabled` / `port` / `allow_write` and applies them: starts the server
@@ -150,15 +161,22 @@ pub async fn mcp_server_apply(
     if config.token.is_empty() {
         config.token = ide_mcp::http::new_token();
     }
-    save(&state, &config)?;
+    if let Err(e) = save(&state, &config) {
+        return soft_fail(&state, &label, e.message);
+    }
     if !enabled {
         stop();
         *LAST_ERROR.lock() = None;
         return Ok(status(&state, &label));
     }
-    let project = state.host.project(&label)?;
+    let project = match state.host.project(&label) {
+        Ok(p) => p,
+        Err(e) => return soft_fail(&state, &label, e.message),
+    };
     let root = project.root.to_string_lossy().into_owned();
-    state.host.require_trust(&label)?;
+    if let Err(e) = state.host.require_trust(&label) {
+        return soft_fail(&state, &label, e.message);
+    }
     // A running server keeps serving what it started with: only an unchanged
     // port + project + write mode can stay.
     let unchanged = SERVER

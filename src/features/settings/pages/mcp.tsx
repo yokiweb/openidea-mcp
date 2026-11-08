@@ -90,7 +90,7 @@ function McpServerSettings() {
     return (
       <Row
         label="Status"
-        hint="The backend does not answer this page: the OpenIDEA build predates it, or its TypeScript bindings are missing."
+        hint="MCP settings did not load. Open a project in this window first; otherwise see the error below."
       >
         <span role="alert">{loadError ?? "Loading…"}</span>
       </Row>
@@ -109,7 +109,9 @@ function McpServerSettings() {
     ? tx`Running on port ${status.port}`
     : status.error
       ? tx`Failed to start: ${status.error}`
-      : tx("Not running");
+      : loadError
+        ? tx`Failed to apply: ${loadError}`
+        : tx("Not running");
   return (
     <>
       <Row
@@ -144,7 +146,10 @@ function McpServerSettings() {
           label={<T>Allow writing SQL</T>}
         />
       </Row>
-      <Row label="Status">
+      <Row
+        label="Status"
+        hint={!status.project ? "Open a project in this window before enabling the MCP server." : undefined}
+      >
         <span role="status">{state}</span>
       </Row>
       <Row label="Endpoint" hint={status.project ? undefined : "Open a project to get its endpoint."}>
