@@ -15,6 +15,7 @@ import {
   type OutputChunk,
   type RunConfig,
   type RunId,
+  type RunInfo,
   type RunImportSource,
   type TestCaseReport,
 } from "@/platform/ipc";
@@ -651,6 +652,118 @@ function newRuntime(config: RunConfig): SessionRuntime {
     terminalSize: null,
   };
   return runtime;
+}
+
+// ---------------------------------------------------------------------------
+// Runs owned by the backend: adopted into real UI sessions
+//
+// The in-app MCP server calls `ide_host::ops::run::start` directly, so no
+// frontend session exists. `runList` finds them; adopting gives them a Run
+// tool window tab, Services state and a console. Output comes from the shared
+// log `tracked_output` appends live (`run-logs/<RunId>.log`), read by byte
+// offset. Both sides share the process, so Stop / runExited work normally.
+
+interface AdoptedLog {
+  runId: RunId;
+  offset: number;
+  /** Stream decoder: a UTF-8 character may be split across reads. */
+  decoder: TextDecoder;
+  /** Empty reads in a row after the run exited (then the cursor is dropped). */
+  idle: number;
+}
+const adoptedLogs = new Map<string, AdoptedLog>();
+
+/** A configuration for a run whose config is not loaded in this window. */
+function fallbackConfig(info: RunInfo): RunConfig {
+  return {
+    id: info.configId,
+    name: info.name,
+    kind: info.configId.split(":")[0] || "application",
+    command: "",
+    args: [],
+    cwd: null,
+    env: {},
+    detected: false,
+    isTest: false,
+    debugAdapter: null,
+  };
+}
+
+/**
+ * Creates a session per backend-owned run and tails its output. Called from
+ * the Services view's `runList` sync; repeated calls only add new run ids.
+ */
+export async function adoptExternalRuns(runs: readonly RunInfo[]): Promise<void> {
+  if (!isTauri()) return;
+  const state = useRun.getState();
+  const known = new Set(state.sessions.map((s) => s.runId));
+  for (const info of runs) {
+    if (!info.running || known.has(info.id)) continue;
+    const config = state.configs.find((c) => c.id === info.configId) ?? fallbackConfig(info);
+    const id = `run${++sessionSeq}`;
+    const session: RunSession = {
+      id,
+      config,
+      runId: info.id,
+      status: "running",
+      exitCode: null,
+      startedAt: Date.now(),
+      endedAt: null,
+      stdinClosed: true, // no input channel to a backend-owned process
+    };
+    runtimes.set(id, newRuntime(config));
+    adoptedLogs.set(id, { runId: info.id, offset: 0, decoder: new TextDecoder(), idle: 0 });
+    useRun.setState((s) => ({ sessions: [...s.sessions, session] }));
+    known.add(info.id);
+  }
+  await pumpAdoptedLogs();
+}
+
+/** The log file `ide_host::ops::run::finalize_run_log` names after `<RunId>.log`. */
+async function adoptedLogPath(runId: RunId): Promise<string> {
+  const { appLocalDataDir, join } = await import("@tauri-apps/api/path");
+  return join(await appLocalDataDir(), "run-logs", `${runId}.log`);
+}
+
+function decodeBase64(data: string): Uint8Array {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/** Incremental tail; several reads per sync so an old log catches up at once. */
+async function pumpAdoptedLogs(): Promise<void> {
+  for (const [sessionId, log] of adoptedLogs) {
+    if (!runtimes.has(sessionId)) {
+      adoptedLogs.delete(sessionId); // tab closed
+      continue;
+    }
+    try {
+      const path = await adoptedLogPath(log.runId);
+      for (let reads = 0; reads < 20; reads++) {
+        const range = await call(commands.fsReadRange(path, log.offset, 262_144));
+        const bytes = decodeBase64(range.data);
+        if (!bytes.length) break;
+        const text = log.decoder.decode(bytes, { stream: true });
+        if (text) enqueue(sessionId, { kind: "stdout", text });
+        log.offset += bytes.length;
+        log.idle = 0;
+        if (log.offset >= range.total) break;
+      }
+    } catch {
+      // The file may still be `pending-*.log`; retry on the next sync.
+    }
+    const session = getSession(sessionId);
+    if (!session) adoptedLogs.delete(sessionId);
+    else if (session && isLive(session)) log.idle = 0;
+    else if (++log.idle > 3) adoptedLogs.delete(sessionId); // exited, log drained
+  }
+}
+
+/** Drops the log cursor (a closed tab, or a test resetting the store). */
+export function forgetAdoptedLogs(): void {
+  adoptedLogs.clear();
 }
 
 /** Runs a configuration's before launch tasks; false aborts the launch. Installed by the feature. */

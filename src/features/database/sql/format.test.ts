@@ -64,6 +64,14 @@ describe("formatSql", () => {
     expect(fmt("select 1 union all select 2;")).toBe("select 1\nunion all\nselect 2;");
   });
 
+  it("lays out a subquery that starts behind a block comment", () => {
+    const out = fmt("with a as (/* note */ select x from t where x > 1) select * from a;");
+    // The comment must not turn the `(select` body into a plain parenthesis:
+    // its clauses still break, at a sane column.
+    expect(out).toMatch(/\n\s+from t\n/);
+    expect(Math.max(...out.split("\n").map((l) => l.length - l.trimStart().length))).toBeLessThanOrEqual(48);
+  });
+
   it("keeps comments, text between statements and the range", () => {
     const sql = "-- head\nselect a -- why\n, b from t;\n\n\nselect   1;";
     expect(fmt(sql)).toBe("-- head\nselect a, -- why\n       b\nfrom t;\n\n\nselect 1;");

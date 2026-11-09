@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RunConfig } from "@/platform/ipc";
+import type { RunConfig, RunInfo } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 
-const ipc = vi.hoisted(() => ({ runConfigs: vi.fn() }));
+const ipc = vi.hoisted(() => ({
+  runConfigs: vi.fn(),
+  runList: vi.fn(async () => [] as RunInfo[]),
+  runStop: vi.fn(async () => ({ status: "ok" as const, data: null })),
+}));
 vi.mock("@/platform/ipc", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/platform/ipc")>()),
   isTauri: () => true,
@@ -15,12 +19,15 @@ import {
   readRan,
   readTypes,
   runServiceItems,
+  runServiceProvider,
   sessionDetail,
   sessionStatus,
+  syncExternalRuns,
+  useExternalRuns,
 } from "./services";
 import { startedPort } from "@/platform/serverPort";
 import { useRun, type RunSession } from "./store";
-import type { DebugServiceSession } from "@/workbench/contributions";
+import type { DebugServiceSession, ServiceTreeItem } from "@/workbench/contributions";
 
 const config = (id: string, kind: string): RunConfig => ({
   id,
@@ -353,5 +360,53 @@ describe("removing a workspace member from Services", () => {
 
     expect(useRun.getState().configs.map((c) => c.id)).toEqual(["app", "serve", "dev2"]);
     expect(readTypes("/w/main")).toEqual(["npm"]);
+  });
+});
+
+describe("backend-owned runs (in-app MCP server)", () => {
+  const c = config("mcp-app", "spring-boot");
+  const external: RunInfo = { id: 42, configId: c.id, name: c.name, pid: 12345, running: true, pty: false };
+
+  afterEach(() => {
+    useRun.setState({ configs: [], sessions: [] });
+    useExternalRuns.setState({ runs: [] });
+    ipc.runList.mockReset();
+    ipc.runList.mockResolvedValue([]);
+    ipc.runStop.mockReset();
+    ipc.runStop.mockResolvedValue({ status: "ok", data: null });
+  });
+
+  it("shows a running service even though the frontend has no session", () => {
+    const [group] = runServiceItems([c], [], DEFAULT_TYPES, [], {}, [], () => false, [external]);
+    expect(group?.detail).toBe("1 running");
+    expect(group?.children?.[0]).toMatchObject({ icon: "run", detail: "MCP · PID 12345", dim: false });
+    // Without the mirror the same configuration stays dark and idle.
+    expect(runServiceItems([c], [], DEFAULT_TYPES)[0]?.children?.[0]).toMatchObject({ dim: true });
+  });
+
+  it("adopts only live backend runs the frontend does not own", async () => {
+    ipc.runList.mockResolvedValue([
+      external, // 42: adopted into a real session
+      { ...external, id: 43, pid: 999 }, // 43: the frontend already has this run id
+      { ...external, id: 44, running: false }, // 44: exited
+    ]);
+    useRun.setState({ sessions: [session("s", c, "running", 1, { runId: 43 })] });
+    await syncExternalRuns();
+    const ids = useRun.getState().sessions.map((s) => s.runId);
+    expect(ids).toContain(42);
+    expect(ids).not.toContain(44);
+    expect(ids.filter((id) => id === 43)).toHaveLength(1);
+    // Adopted runs need no fallback state mirror.
+    expect(useExternalRuns.getState().runs).toEqual([]);
+  });
+
+  it("lets Stop reach a backend-owned run", () => {
+    useRun.setState({ configs: [c], sessions: [] });
+    useExternalRuns.setState({ runs: [external] });
+    const item = { key: "run:config:mcp-app" } as ServiceTreeItem;
+    const stop = runServiceProvider.actions?.(item)?.find((a) => a.id === "stop");
+    expect(stop?.disabled).toBe(false);
+    stop?.run();
+    expect(ipc.runStop).toHaveBeenCalledWith(42);
   });
 });

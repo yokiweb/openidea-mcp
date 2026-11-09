@@ -93,6 +93,12 @@ const JOIN_MODIFIERS = new Set(["LEFT", "RIGHT", "FULL", "INNER", "CROSS", "NATU
 const ITEM_COLUMN: Record<string, number> = { SELECT: 7, FROM: 5, SET: 4, VALUES: 7 };
 /** Keywords written like functions: `cast(x as int)`. */
 const CALL_KEYWORDS = new Set(["CAST"]);
+/**
+ * Beyond this column, aligning a subquery to its `(` stops helping: on a long
+ * single-line statement the alignment compounds frame by frame and pushes the
+ * SQL off-screen (a MyBatis log is one line, however long the query is).
+ */
+const MAX_INDENT = 48;
 
 interface Frame {
   kind: "query" | "create" | "plain";
@@ -110,7 +116,7 @@ function formatStatement(items: Item[], base: string): string {
   let line = "";
   const newline = (column: number) => {
     lines.push(line.trimEnd());
-    line = " ".repeat(column);
+    line = " ".repeat(Math.min(column, MAX_INDENT));
   };
   const atLineStart = () => line.trim() === "";
   const create = isCreateTable(items);
@@ -164,7 +170,11 @@ function formatStatement(items: Item[], base: string): string {
       if (word === "BETWEEN") frame.between = true;
     }
     if (it.kind === "punct" && it.text === "(") {
-      const next = items[i + 1];
+      // `as (/* why */ select …)`: a block comment between the parenthesis and
+      // the keyword must not turn the subquery into a plain parenthesis.
+      let j = i + 1;
+      while (items[j]?.kind === "comment") j++;
+      const next = items[j];
       if (create && frames.length === 1 && isCreateBodyParen(items, i)) {
         // `create table t\n(\n    a int,\n    …\n)`.
         line = line.slice(0, -1).trimEnd();
@@ -173,7 +183,7 @@ function formatStatement(items: Item[], base: string): string {
         frames.push({ kind: "create", indent: frame.indent + 4, clause: "", count: 0, between: false });
         newline(frame.indent + 4);
       } else if (next?.kind === "word" && (next.upper === "SELECT" || next.upper === "WITH")) {
-        frames.push({ kind: "query", indent: line.length, clause: "", count: 0, between: false });
+        frames.push({ kind: "query", indent: Math.min(line.length, MAX_INDENT), clause: "", count: 0, between: false });
       } else {
         frames.push({ kind: "plain", indent: frame.indent, clause: "", count: 0, between: false });
       }

@@ -8,8 +8,11 @@ import {
   parseMybatisParameters,
 } from "./mybatis";
 
-const log = (text: string) =>
-  text.split("\n").map((t, i) => ({ id: i + 1, text: t }));
+const log = (text: string) => text.split("\n").map((t, i) => ({ id: i + 1, text: t }));
+
+/** 一条真实的长 CTE 日志：块注释 + 嵌套子查询 + Oracle 语法（G4 回归）。 */
+const LONG_CTE =
+  "WITH well AS ( /* 井号/单位过滤统一在这里解析成 jhdm 集合 */ SELECT j.jhdm FROM znsfqxmk.dj_jcxx j WHERE (j.jh IN ( ? ) OR j.jhdm IN ( ? )) /* 井代码直配分支：仅在未传 jbdm 时需要（传了 jbdm 时原 SQL 也要求 jcxx 行存在） */ UNION SELECT ? AS jhdm FROM dual ), production AS ( SELECT s.rq, s.id, s.jhdm, s.pzl, s.scsj, s.zsl, ROW_NUMBER() OVER (ORDER BY s.rq DESC, s.id DESC) AS row_number FROM znsfqxmk.sj_rd_scsj s WHERE s.jhdm IN (SELECT jhdm FROM well) ), treatment AS ( SELECT g.jhdm, g.qzyy, g.zlcs, ROW_NUMBER() OVER ( PARTITION BY g.jhdm ORDER BY g.zlsj DESC NULLS LAST, g.ny DESC NULLS LAST, g.id DESC ) AS row_number FROM znsfq_cygc.sj_bdq_qzzlxggz g WHERE g.jhdm IN (SELECT jhdm FROM well) ), record AS ( SELECT p.*, t.qzyy, t.zlcs FROM production p LEFT JOIN treatment t ON t.jhdm = p.jhdm AND t.row_number = 1 WHERE p.row_number = 1 ), conclusion AS ( SELECT 1 AS sort_no, '欠注井，欠注水量' AS label, CAST(ROUND(GREATEST( COALESCE(pzl, 0) * COALESCE(scsj, 0) / 24 - COALESCE(zsl, 0), 0 ), 2) AS VARCHAR) || ' m³/d' AS value FROM record UNION ALL SELECT 2 AS sort_no, '欠注原因' AS label, COALESCE(NULLIF(TRIM(qzyy), ''), '暂无') AS value FROM record UNION ALL SELECT 3 AS sort_no, '治理措施' AS label, COALESCE(NULLIF(TRIM(zlcs), ''), '暂无') AS value FROM record ) SELECT label, value FROM conclusion ORDER BY sort_no";
 
 describe("parseMybatisParameters", () => {
   it("splits on known type anchors even with commas in values", () => {
@@ -82,7 +85,9 @@ describe("parseMybatisLog", () => {
   });
 
   it("missing parameters leave placeholders and break completeness", () => {
-    const entries = parseMybatisLog(log("==> Preparing: select * from t where a = ? and b = ?\n==> Parameters: 1(Integer)"));
+    const entries = parseMybatisLog(
+      log("==> Preparing: select * from t where a = ? and b = ?\n==> Parameters: 1(Integer)"),
+    );
     expect(entries[0]!.sql).toBe("select * from t where a = 1 and b = ?");
     expect(entries[0]!.complete).toBe(false);
   });
@@ -94,9 +99,7 @@ describe("parseMybatisLog", () => {
   });
 
   it("skips statements whose parameters never appear before the next Preparing", () => {
-    const entries = parseMybatisLog(
-      log("==> Preparing: a ?\n==> Preparing: b ?\n==> Parameters: 1(Integer)"),
-    );
+    const entries = parseMybatisLog(log("==> Preparing: a ?\n==> Preparing: b ?\n==> Parameters: 1(Integer)"));
     expect(entries.map((e) => e.sql)).toEqual(["a ?", "b 1"]);
     expect(entries[0]!.complete).toBe(false);
   });
@@ -124,6 +127,22 @@ describe("formatMybatisSql", () => {
     expect(formatMybatisSql("select * from a left join b on a.id = b.id where a.x = 1")).toContain(
       "\n         left join b on a.id = b.id",
     );
+  });
+
+  it("keeps a long single-line CTE query readable", () => {
+    const entries = parseMybatisLog(
+      log(`==> Preparing: ${LONG_CTE}\n==> Parameters: NHT165X4(String), NHT165X4(String), NHT165X4(String)`),
+    );
+    expect(entries[0]!.complete).toBe(true);
+    const f = formatMybatisSql(entries[0]!.sql);
+    const lines = f.split("\n");
+    // 超长单行里嵌套的 query frame 曾把缩进逐层累加到 386 列，SQL 被推到屏幕外。
+    expect(Math.max(...lines.map((l) => l.length - l.trimStart().length))).toBeLessThanOrEqual(48);
+    expect(f.length).toBeLessThan(3000);
+    expect(f).toContain("FROM conclusion");
+    expect(f).toContain("ORDER BY sort_no");
+    // 块注释后的 SELECT 仍是一个子查询，不能和它的 FROM 挤在同一行。
+    expect(lines.find((l) => l.includes("SELECT j.jhdm"))).not.toContain("FROM znsfqxmk.dj_jcxx");
   });
 });
 

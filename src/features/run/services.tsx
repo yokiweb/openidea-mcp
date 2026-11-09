@@ -9,7 +9,8 @@
 import { useEffect, useMemo } from "react";
 import { create } from "zustand";
 import { executeAction } from "@/platform/actions";
-import type { RunConfig } from "@/platform/ipc";
+import { commands, isTauri } from "@/platform/ipc";
+import type { RunConfig, RunInfo } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { projectLocation, useRemote } from "@/platform/remote";
 import { tx, useT, useTxTemplate } from "@/platform/i18n";
@@ -35,6 +36,7 @@ import {
   loadConfigs,
   persistTemporary,
   rerunConfig,
+  adoptExternalRuns,
   startRun,
   stopSession,
   useRun,
@@ -208,6 +210,50 @@ export async function cleanupRemovedProject(removedRoot: string): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
+// Runs the backend owns but the frontend has no session for
+
+/**
+ * The in-app MCP server starts processes through `ide_host::ops::run::start`
+ * directly, so `startRun()` never creates a session for them. Services mirrors
+ * their state from the backend's process list: no console, no rerun, just
+ * "running / PID / stop". stdio MCP runs in another process and is not visible.
+ */
+export const useExternalRuns = create<{ runs: RunInfo[] }>(() => ({ runs: [] }));
+
+/** Adopts backend-owned runs into real sessions; only unadopted ones stay mirrored. */
+export async function syncExternalRuns(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const runs = await commands.runList();
+    const local = new Set(
+      useRun
+        .getState()
+        .sessions.map((s) => s.runId)
+        .filter((id): id is number => id !== null),
+    );
+    const owned = runs.filter((r) => r.running && !local.has(r.id));
+    await adoptExternalRuns(owned);
+    // A run the frontend could not adopt (no config, no log) still shows its state.
+    const adopted = new Set(useRun.getState().sessions.map((s) => s.runId));
+    useExternalRuns.setState({ runs: owned.filter((r) => !adopted.has(r.id)) });
+  } catch {
+    // No backend (browser preview) or a transient IPC error: keep the last state.
+  }
+}
+
+/** External runs behind one tree item (a configuration, or a whole type group). */
+function externalRunsOf(r: Resolved): RunInfo[] {
+  const ids = r.config
+    ? [r.config.id]
+    : useRun
+        .getState()
+        .configs.filter((c) => c.kind === r.kind)
+        .map((c) => c.id);
+  const set = new Set(ids);
+  return useExternalRuns.getState().runs.filter((e) => set.has(e.configId));
+}
+
+// ---------------------------------------------------------------------------
 // Tree
 
 const busy = (s: RunSession) => isLive(s);
@@ -253,9 +299,11 @@ export function runServiceItems(
   order: ServiceOrder = {},
   debug: readonly DebugServiceSession[] = [],
   removed: (id: string) => boolean = () => false,
+  external: readonly RunInfo[] = [],
 ): ServiceTreeItem[] {
   const executions = serviceSessions(sessions, debug);
   const latest = currentServiceSessions(executions);
+  const externalByConfig = new Map(external.map((r) => [r.configId, r]));
   const kinds = [...added];
   const shown = (s: ServiceSession) => liveServiceSession(s) || !removed(s.config.id);
   for (const s of executions) if (shown(s) && !kinds.includes(s.config.kind)) kinds.push(s.config.kind);
@@ -272,17 +320,19 @@ export function runServiceItems(
     if (!entries.length && DEFAULT_TYPES.includes(kind)) return [];
     const children = orderServices(entries, order[kind]).map((c): ServiceTreeItem => {
       const s = latest.get(c.id);
+      const live = !!s && liveServiceSession(s);
+      const ext = externalByConfig.get(c.id);
       return {
         key: CONFIG_PREFIX + c.id,
         label: c.name,
-        icon: serviceDebugger(s) ? "debug" : s && liveServiceSession(s) ? "run" : configIcon(c),
-        detail: executionDetail(s),
-        dim: !s || !liveServiceSession(s),
+        icon: serviceDebugger(s) ? "debug" : live || !!ext ? "run" : configIcon(c),
+        detail: ext ? `MCP · PID ${ext.pid ?? "?"}` : executionDetail(s),
+        dim: !ext && !live,
       };
     });
     const running = entries.filter((c) => {
       const s = latest.get(c.id);
-      return !!s && liveServiceSession(s);
+      return (!!s && liveServiceSession(s)) || externalByConfig.has(c.id);
     }).length;
     return [
       {
@@ -308,10 +358,23 @@ function useRoots(): ServiceTreeItem[] {
   const typesRoot = useAddedTypes((s) => s.root);
   const ran = useRanConfigs((s) => s.ids);
   const ranRoot = useRanConfigs((s) => s.root);
+  const external = useExternalRuns((s) => s.runs);
   useEffect(() => {
     if (typesRoot !== root) useAddedTypes.setState({ root, types: root ? readTypes(root) : [] });
     if (ranRoot !== root) useRanConfigs.setState({ root, ids: root ? readRan(root) : [] });
   }, [root, typesRoot, ranRoot]);
+  // MCP starts processes without a frontend session; mirror the backend's list
+  // on mount, on focus and periodically (a stop from another client too).
+  useEffect(() => {
+    void syncExternalRuns();
+    const timer = window.setInterval(() => void syncExternalRuns(), 3000);
+    const onFocus = () => void syncExternalRuns();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
   return useMemo(
     () =>
       runServiceItems(
@@ -322,8 +385,9 @@ function useRoots(): ServiceTreeItem[] {
         order,
         debug,
         configRemoved,
+        external,
       ),
-    [configs, sessions, types, typesRoot, ran, ranRoot, root, order, debug],
+    [configs, sessions, types, typesRoot, ran, ranRoot, root, order, debug, external],
   );
 }
 
@@ -372,12 +436,16 @@ function debug(r: Resolved) {
 function actions(item: ServiceTreeItem): ServiceItemAction[] {
   const r = resolve(item);
   const running = r.sessions.filter(liveServiceSession);
+  const external = externalRunsOf(r);
   const stop = {
     id: "stop",
     title: "Stop",
     icon: "stop",
-    disabled: !running.length,
-    run: () => void stopServiceSessions(running),
+    disabled: !running.length && !external.length,
+    run: () => {
+      void stopServiceSessions(running);
+      for (const e of external) void commands.runStop(e.id);
+    },
   };
   if (!r.config) return [stop];
   const live = !!r.session && liveServiceSession(r.session);
@@ -444,13 +512,15 @@ function menu(item: ServiceTreeItem): MenuItem[] {
 }
 
 function RunDetail({ item }: { item: ServiceTreeItem }) {
-  // Re-render on session changes.
+  // Re-render on session changes, and on backend-owned runs (MCP).
   useRun((s) => s.sessions);
+  useExternalRuns((s) => s.runs);
   const debugViews = useDebugRunSessions();
   const Console = debugViews.Console;
   const t = useT();
   const txTemplate = useTxTemplate();
   const r = resolve(item);
+  const external = externalRunsOf(r)[0];
   if (!r.config)
     return (
       <EmptyState title={kindLabel(r.kind ?? "")}>
@@ -503,9 +573,7 @@ function RunDetail({ item }: { item: ServiceTreeItem }) {
         <dt>
           <T>Status</T>
         </dt>
-        <dd>
-          <T>Not started</T>
-        </dd>
+        <dd>{external ? `Running · MCP · PID ${external.pid ?? "?"}` : <T>Not started</T>}</dd>
       </dl>
       <div className={styles.actions}>
         <Button icon="run" disabled={isDebugOnly(r.config)} onClick={() => run(r)}>
@@ -549,6 +617,8 @@ export const runServiceProvider: ServiceProviderContribution = {
   menu,
   activate: (item) => {
     const r = resolve(item);
+    // The backend already runs this one: activating must not start a second process.
+    if (externalRunsOf(r).length) return;
     if (r.config && !(r.session && liveServiceSession(r.session)) && !isDebugOnly(r.config)) run(r);
   },
   detail: RunDetail,
