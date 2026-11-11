@@ -3,7 +3,9 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { executeAction, registerAction, allActions, isActionEnabled } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import type { BuildModel, GradleModel, ProjectInfo, RunConfig } from "@/platform/ipc";
+import { emitLocalIdeEvent } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
+import { usePlatform } from "@/platform/platformInfo";
 import { GradleView, MavenView } from "./BuildToolView";
 import { activate } from "./index";
 import { expandableKeys, gradleChildren, gradleRoots, gradleProjectKey } from "./model";
@@ -19,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   confirm: vi.fn(),
   menu: vi.fn(),
   link: vi.fn(),
+  notify: vi.fn(),
   unlink: vi.fn(),
   show: vi.fn(),
   sync: vi.fn(),
@@ -51,6 +54,7 @@ vi.mock("@tauri-apps/api/core", async (original) => ({
 vi.mock("@/workbench/contributions", async (original) => ({
   ...(await original<typeof import("@/workbench/contributions")>()),
   toolWindowService: () => ({ show: mocks.show }),
+  notifications: () => ({ notify: mocks.notify }),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.open }));
 vi.mock("@/workbench/messages", () => ({ confirm: mocks.confirm }));
@@ -110,6 +114,22 @@ afterEach(() => {
   dispose();
   useProject.setState({ project: null });
   setContext("projectOpen", false);
+});
+
+it("re-reads the build model when an applied Groovy or Kotlin script changes", async () => {
+  vi.useFakeTimers();
+  try {
+    for (const path of ["/p/gradle/dependencies.gradle", "/p/gradle/dependencies.gradle.kts"]) {
+      const calls = mocks.model.mock.calls.length;
+      await act(async () => {
+        emitLocalIdeEvent({ type: "fsChanged", created: [], modified: [path], removed: [] });
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(mocks.model).toHaveBeenCalledTimes(calls + 1);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("offers unlink on a root's context menu and persists a confirmed project setting", async () => {
@@ -226,6 +246,43 @@ it.each([null, "/outside/pom.xml", "/p/a/build.xml", "/p/../outside/pom.xml", "/
   },
 );
 
+it("links `\\\\?\\`-prefixed and differently-cased picks on Windows", async () => {
+  const os = usePlatform.getState().os;
+  usePlatform.setState({ os: "windows" });
+  try {
+    useProject.setState({ project: { root: "C:\\Projects\\demo" } as ProjectInfo });
+    mocks.get.mockResolvedValue({
+      languages: { java: { maven: { unlinkedProjects: [], linkedProjects: [] } } },
+    });
+    mocks.open.mockResolvedValue(["\\\\?\\C:\\Projects\\demo\\svc\\pom.xml", "c:/Projects/demo/web/pom.xml"]);
+    await act(async () => {
+      await executeAction("maven.addProjects");
+    });
+    expect(mocks.set).toHaveBeenCalledWith(
+      "project",
+      "languages.java.maven.linkedProjects",
+      '["svc/pom.xml","web/pom.xml"]',
+    );
+  } finally {
+    usePlatform.setState({ os });
+  }
+});
+
+it("warns about picks outside the project instead of silently doing nothing", async () => {
+  mocks.open.mockResolvedValue("/other/pom.xml");
+  await act(async () => {
+    await executeAction("maven.addProjects");
+  });
+  expect(mocks.set).not.toHaveBeenCalled();
+  expect(mocks.notify).toHaveBeenCalledWith(
+    expect.objectContaining({
+      level: "warning",
+      title: expect.stringContaining("not added"),
+      body: expect.stringContaining("/other/pom.xml"),
+    }),
+  );
+});
+
 it("links picked POMs that no reactor lists as independent top-level projects", async () => {
   mocks.get.mockResolvedValue({
     languages: { java: { maven: { unlinkedProjects: ["b/pom.xml"], linkedProjects: ["tools/pom.xml"] } } },
@@ -341,7 +398,8 @@ it("runs duplicate task paths with the selected build's wrapper, cwd and offline
       command: "/p/second/gradlew",
       cwd: "second",
       args: [":app:test", "--offline"],
-      env: { JAVA_HOME: "/second/jdk" },
+      // The build's `JAVA_HOME` follows Settings at launch instead of being frozen here (#2433).
+      env: {},
     });
 });
 

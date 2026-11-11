@@ -7,6 +7,7 @@ pub mod conn;
 pub mod history;
 mod oracle;
 pub mod plan;
+pub mod plugin;
 pub mod secrets;
 pub mod source;
 pub mod split;
@@ -56,6 +57,7 @@ impl DbTableKind {
 pub enum DbObjectKind {
     Function,
     Procedure,
+    Package,
     Trigger,
     Sequence,
 }
@@ -91,12 +93,21 @@ pub struct SequenceInfo {
     pub data_type: String,
 }
 
-/// A schema's routines and sequences (the tree's `routines` / `sequences` folders).
+/// An Oracle package (its procedures and functions are not listed separately).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+#[serde(rename = "DbPackageInfo")]
+pub struct PackageInfo {
+    pub name: String,
+}
+
+/// A schema's routines (procedures and functions), packages and sequences.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 #[serde(rename = "DbSchemaObjects")]
 pub struct SchemaObjects {
     pub routines: Vec<RoutineInfo>,
+    pub packages: Vec<PackageInfo>,
     pub sequences: Vec<SequenceInfo>,
 }
 
@@ -295,7 +306,7 @@ fn through_tunnel(e: IdeError, source: &DataSource, via: Option<&str>) -> IdeErr
 
 /// Options › Run keep-alive query: pings the pool until it is closed or dropped
 /// (a dropped SSH tunnel or an idle-killing proxy stays alive meanwhile).
-fn keep_alive(pool: &Arc<Pool>, every: Duration) {
+pub(crate) fn keep_alive(pool: &Arc<Pool>, every: Duration) {
     let pool = Arc::downgrade(pool);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
@@ -381,7 +392,9 @@ impl DbManager {
     /// Where the saved passwords of data source `id` live: app-wide for a global one.
     fn saved_for(&self, id: &str) -> &SecretStore {
         match &self.global {
-            Some((_, store)) if self.global_sources().iter().any(|s| s.id == id) => store,
+            Some((_, store)) if self.sources().is_ok_and(|sources| sources.iter().any(|s| s.id == id && s.global)) => {
+                store
+            }
             _ => &self.saved_passwords,
         }
     }
@@ -412,19 +425,28 @@ impl DbManager {
     /// Saves the data source list; connections of removed or changed sources are closed.
     /// Global ones (`global`) go to the app-wide list, the others to the project's.
     pub async fn save_sources(&self, sources: Vec<DataSource>) -> IdeResult<()> {
-        let old = self.sources().unwrap_or_default();
-        let (global, project): (Vec<_>, Vec<_>) = sources.iter().cloned().partition(|s| s.global);
-        match &self.global {
-            // Rewritten only when it changes: other projects' windows edit the same file.
-            Some((dir, _)) => {
-                if global != old.iter().filter(|s| s.global).cloned().collect::<Vec<_>>() {
-                    source::save_global(dir, &global)?;
-                }
-            }
-            None if !global.is_empty() => return Err(IdeError::invalid("global data sources are not available here")),
-            None => {}
+        if sources.iter().any(|s| s.global && s.plugin_owner.is_some()) {
+            return Err(IdeError::invalid("plugin-owned data sources must stay project-scoped"));
         }
-        source::save(&self.root, &project)?;
+        let old = {
+            let _guard = plugin::EDIT.lock();
+            let old = self.sources().unwrap_or_default();
+            let (global, project): (Vec<_>, Vec<_>) = sources.iter().cloned().partition(|s| s.global);
+            match &self.global {
+                // Rewritten only when it changes: other projects' windows edit the same file.
+                Some((dir, _)) => {
+                    if global != old.iter().filter(|s| s.global).cloned().collect::<Vec<_>>() {
+                        source::save_global(dir, &global)?;
+                    }
+                }
+                None if !global.is_empty() => {
+                    return Err(IdeError::invalid("global data sources are not available here"));
+                }
+                None => {}
+            }
+            source::save(&self.root, &project)?;
+            old
+        };
         for o in old {
             match sources.iter().find(|s| s.id == o.id) {
                 Some(n) if *n == o => {}
@@ -841,6 +863,14 @@ impl DbManager {
                 })
                 .collect();
         }
+        if let Some(q) = sql::packages(driver, schema) {
+            out.packages = pool
+                .rows(&q, MAX_META_ROWS)
+                .await?
+                .into_iter()
+                .filter_map(|r| Some(PackageInfo { name: r.into_iter().next().flatten()? }))
+                .collect();
+        }
         if let Some(q) = sql::sequences(driver, schema) {
             out.sequences = pool
                 .rows(&q, MAX_META_ROWS)
@@ -858,9 +888,29 @@ impl DbManager {
         Ok(out)
     }
 
-    /// The definition of a routine (every overload), trigger or sequence.
+    /// The definition of a routine (every overload), package (spec and body), trigger or sequence.
     pub async fn object_ddl(&self, id: &str, schema: &str, kind: DbObjectKind, name: &str) -> IdeResult<String> {
         let pool = self.pool(id).await?;
+        if kind == DbObjectKind::Package {
+            let mut defs: Vec<String> = Vec::new();
+            for body in [false, true] {
+                let Some(q) = sql::package_ddl(pool.driver(), schema, name, body) else { continue };
+                match pool.rows(&q, MAX_META_ROWS).await {
+                    Ok(rows) => defs.extend(rows.into_iter().filter_map(|r| r.into_iter().next().flatten())),
+                    // A spec-only package has no body: the spec alone still opens.
+                    Err(e) if body => tracing::warn!("package body {schema}.{name}: {}", e.message),
+                    Err(e) => return Err(e),
+                }
+            }
+            if defs.is_empty() {
+                return Err(IdeError::not_found(format!("{schema}.{name}")));
+            }
+            return Ok(defs
+                .iter()
+                .map(|d| format!("{};\n", d.trim_end().trim_end_matches(';')))
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
         let (q, column) = sql::object_ddl(pool.driver(), schema, kind, name)
             .ok_or_else(|| IdeError::invalid(format!("no {kind:?} objects in this database")))?;
         let defs: Vec<String> = pool

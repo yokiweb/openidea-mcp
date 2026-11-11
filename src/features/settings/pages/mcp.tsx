@@ -13,7 +13,6 @@ import { tx } from "@/platform/i18n";
 import { call, commands, isTauri, type McpServerStatus } from "@/platform/ipc";
 import { Button, Checkbox, Input, T, copyText } from "@/ui";
 import { Row } from "../components/Form";
-import type { PageSpec } from "./spec";
 
 /** `mcpServers` entry of an MCP client (Claude Code, Cursor…) over HTTP. */
 function httpConfig(status: McpServerStatus): string | null {
@@ -42,7 +41,7 @@ function stdioConfig(status: McpServerStatus): string | null {
   return JSON.stringify({ mcpServers: { openidea: { type: "stdio", command, args } } }, null, 2);
 }
 
-function McpServerSettings() {
+export function McpServerSettings() {
   const [status, setStatus] = useState<McpServerStatus | null>(null);
   const [port, setPort] = useState("");
   const [busy, setBusy] = useState(false);
@@ -56,7 +55,11 @@ function McpServerSettings() {
     // 必须走 call()：bindings 的命令返回 { status, data | error } 外壳，
     // 直接把外壳塞进 state 会让 status.stdioCommand / status.port 全是 undefined。
     void call(
-      commands.mcpServerApply(next.enabled ?? status.enabled, nextPort ?? status.port, next.allowWrite ?? status.allowWrite),
+      commands.mcpServerApply(
+        next.enabled ?? status.enabled,
+        nextPort ?? status.port,
+        next.allowWrite ?? status.allowWrite,
+      ),
     )
       .then(
         (fresh) => {
@@ -183,25 +186,3 @@ function McpServerSettings() {
     </>
   );
 }
-
-export const MCP_PAGES: PageSpec[] = [
-  {
-    id: "tools.mcpServer",
-    title: "MCP Server",
-    group: "Tools",
-    order: 604,
-    keywords: ["mcp", "model context protocol", "ai", "agent", "claude", "codex", "stdio", "http", "port", "token"],
-    sections: [
-      {
-        options: [
-          {
-            kind: "custom",
-            label: "Enable MCP server",
-            keywords: ["Port", "Status", "Endpoint", "Client configuration", "Copy HTTP Config", "Copy Stdio Config"],
-            component: McpServerSettings,
-          },
-        ],
-      },
-    ],
-  },
-];

@@ -70,6 +70,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("proto", include_str!("../../../languages/proto.toml")),
     ("python", include_str!("../../../languages/python.toml")),
     ("r", include_str!("../../../languages/r.toml")),
+    ("restructuredtext", include_str!("../../../languages/restructuredtext.toml")),
     ("ruby", include_str!("../../../languages/ruby.toml")),
     ("rust", include_str!("../../../languages/rust.toml")),
     ("sass", include_str!("../../../languages/sass.toml")),
@@ -562,6 +563,7 @@ mod tests {
         "R",
         "RPM Changes",
         "RPM Spec",
+        "reStructuredText",
         "Ruby",
         "SAS",
         "Scala",
@@ -628,6 +630,12 @@ mod tests {
         let asciidoc = reg.get(&LanguageId::new("asciidoc")).unwrap();
         assert_eq!(asciidoc.ui_mode.as_deref(), Some("AsciiDoc"));
         assert_eq!(asciidoc.line_comment.as_deref(), Some("//"));
+        for path in ["guide.rst", "README.RST"] {
+            assert_eq!(detect(&reg, path), "restructuredtext");
+        }
+        let rst = reg.get(&LanguageId::new("restructuredtext")).unwrap();
+        assert_eq!(rst.ui_mode.as_deref(), Some("reStructuredText"));
+        assert_eq!(rst.line_comment.as_deref(), Some(".."));
         assert_eq!(reg.detect(Path::new("script"), Some("#!/usr/bin/env python3")).as_str(), "python");
         assert_eq!(detect(&reg, "README"), "plaintext");
         assert_eq!(detect(&reg, "unknown.zzz"), "plaintext");
@@ -664,7 +672,10 @@ mod tests {
         };
         // After the TypeScript fallback (an available server before it would hide
         // it); before the HTML server (hover, rename and symbols take the first).
-        assert_eq!(names("typescript"), ["vtsls", "typescript-language-server", "angular-language-server", "oxlint"]);
+        assert_eq!(
+            names("typescript"),
+            ["vtsls", "typescript-language-server", "angular-language-server", "oxlint", "eslint"]
+        );
         assert_eq!(names("html"), ["angular-language-server", "vscode-html-language-server"]);
         for lang in ["typescript", "html"] {
             let cfg = reg.get(&LanguageId::new(lang)).unwrap();
@@ -693,6 +704,33 @@ mod tests {
     }
 
     #[test]
+    fn eslint_serves_js_files_only_below_its_config() {
+        let reg = reg();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in ["apps/web/src", "apps/admin/src", "apps/api"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("apps/web/eslint.config.mjs"), "export default [];").unwrap();
+        std::fs::write(root.join("apps/admin/package.json"), r#"{"eslintConfig": {"root": true}}"#).unwrap();
+        std::fs::write(root.join("apps/api/package.json"), r#"{"name": "api"}"#).unwrap();
+        for lang in ["javascript", "javascriptreact", "typescript", "typescriptreact", "vue", "svelte", "astro"] {
+            let cfg = reg.get(&LanguageId::new(lang)).unwrap();
+            let eslint = cfg.language_servers.iter().find(|s| s.name == "eslint").unwrap();
+            assert_eq!(eslint.command, "vscode-eslint-language-server", "{lang}");
+            assert!(eslint.require_root_marker && !eslint.fallback, "{lang}");
+            let settings = eslint.settings.as_ref().unwrap();
+            assert_eq!(settings.get("validate"), Some(&"on".into()), "{lang}");
+            // The server reads `experimental.useFlatConfig` and fails every request without the object.
+            assert!(settings.get("experimental").is_some_and(serde_json::Value::is_object), "{lang}");
+            let served = |file: &str| crate::marked_root(Some(root), &root.join(file), &eslint.root_markers);
+            assert_eq!(served("apps/web/src/main.ts"), Some(root.join("apps/web")), "{lang}");
+            assert_eq!(served("apps/admin/src/main.ts"), Some(root.join("apps/admin")), "{lang}");
+            assert_eq!(served("apps/api/main.ts"), None, "{lang}: package.json without eslintConfig");
+        }
+    }
+
+    #[test]
     fn laravel_lsp_serves_php_files_only_below_artisan() {
         let reg = reg();
         let cfg = reg.get(&LanguageId::new("php")).unwrap();
@@ -701,6 +739,8 @@ mod tests {
         assert_eq!(names, ["intelephense", "phpactor", "laravel-lsp"]);
         let lsp = cfg.language_servers.iter().find(|s| s.name == "laravel-lsp").unwrap();
         assert_eq!(lsp.command.as_str(), "laravel-lsp");
+        // Its `lsp` command takes no options and speaks over stdio; `--stdio` stops it at startup.
+        assert!(lsp.args.is_empty(), "{:?}", lsp.args);
         assert!(lsp.require_root_marker && !lsp.fallback);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -999,11 +1039,11 @@ mod tests {
     }
 
     #[test]
-    fn astro_server_reads_the_project_typescript() {
+    fn astro_server_leaves_typescript_sdk_resolution_to_the_launcher() {
         let reg = reg();
         let ls = &reg.get(&LanguageId::new("astro")).unwrap().language_servers[0];
         let tsdk = ls.initialization_options.as_ref().and_then(|o| o.get("typescript")?.get("tsdk")?.as_str());
-        assert_eq!(tsdk, Some("node_modules/typescript/lib"));
+        assert_eq!(tsdk, None);
     }
 
     #[test]

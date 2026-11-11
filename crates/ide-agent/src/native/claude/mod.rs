@@ -7,8 +7,8 @@
 //! <id>.json`): loading that session, from this connection or a fresh one, starts it that
 //! way.
 
-mod cli;
-mod history;
+pub(crate) mod cli;
+pub(crate) mod history;
 mod settings;
 mod tools;
 mod translate;
@@ -67,6 +67,75 @@ pub(crate) fn connect(
     };
     let shim = Shim::new(config, Arc::new(cli::Process), Arc::from(on_stderr));
     Ok(super::serve(shim, client))
+}
+
+/// What discovery found: ACP `availableCommands`, `configOptions` for the configured model,
+/// and each model's effort option by model value (`None`: none).
+pub(crate) struct Discovered {
+    pub commands: Vec<Value>,
+    pub options: Value,
+    pub efforts: Vec<(String, Option<Value>)>,
+}
+
+/// Discover the slash commands and the model, mode and effort options without a prompt,
+/// ACP session, or pending session file.
+pub(crate) async fn discover(spec: ProviderSpec, cwd: PathBuf) -> Result<Discovered, String> {
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        let spec = tokio::task::spawn_blocking(move || (spec.resolve_for_launch(&cwd), cwd));
+        let (spec, cwd) = spec.await.map_err(|e| e.to_string())?;
+        let mut args = spec.args;
+        args.extend(Start::New { id: uuid::Uuid::new_v4().to_string() }.args());
+        let launch = Launch { program: spec.command, args, cwd, env: spec.env };
+        let mut io = cli::Process.launch(&launch, Arc::new(|_| {})).map_err(|e| e.to_string())?;
+        let _stop = io.kill.clone().drop_guard();
+        let mut lines = BufReader::new(io.stdout).lines();
+        let init = control(
+            &mut io.stdin,
+            &mut lines,
+            "commands",
+            json!({ "subtype": "initialize", "perTaskStopAffordance": true }),
+        )
+        .await?
+        .ok_or("Claude Code did not initialize")?;
+        // The effort and model the user configured; without them the options show the defaults.
+        let applied = tokio::time::timeout(
+            Duration::from_secs(2),
+            control(&mut io.stdin, &mut lines, "settings", json!({ "subtype": "get_settings" })),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .unwrap_or_default();
+        let settings = Settings::from_cli(&init, &applied);
+        Ok(Discovered {
+            commands: settings.commands.clone(),
+            options: settings.options(),
+            efforts: settings.efforts_by_model(),
+        })
+    })
+    .await
+    .map_err(|_| "Claude Code command discovery timed out".to_owned())?
+}
+
+/// Sends one control request and waits for its response; `None` when the CLI answered with an error.
+async fn control(
+    stdin: &mut (impl AsyncWriteExt + Unpin),
+    lines: &mut tokio::io::Lines<impl AsyncBufReadExt + Unpin>,
+    id: &str,
+    request: Value,
+) -> Result<Option<Value>, String> {
+    let line = json!({ "type": "control_request", "request_id": id, "request": request });
+    stdin.write_all(format!("{line}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+    stdin.flush().await.map_err(|e| e.to_string())?;
+    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        if msg["type"] == "control_response" && msg["response"]["request_id"] == id {
+            let response = &msg["response"];
+            return Ok((response["subtype"] == "success").then(|| response["response"].clone()));
+        }
+    }
+    Err("Claude Code exited".into())
 }
 
 struct Config {

@@ -1,4 +1,4 @@
-//! Tools › MCP Server: runs `ide_mcp::McpServer` over the built-in host tools
+//! Agents › MCP Server: runs `ide_mcp::McpServer` over the built-in host tools
 //! while it is turned on in Settings, and reports where it listens.
 //!
 //! 与上游的差异（用户 2026-11-10 确认）：开关、端口、token 全部持久化在
@@ -114,6 +114,7 @@ fn start(state: &AppState, config: &Config) {
     ) {
         Ok(started) => {
             let exe = std::env::current_exe().unwrap_or_default();
+            state.host.set_mcp_executable(Some(exe.clone()));
             ide_agent::set_mcp_executable(Some(exe));
             *running = Some(Running { server: started, port: config.port, allow_write: config.allow_write });
             *state.mcp.error.lock() = None;
@@ -131,6 +132,7 @@ pub fn apply(state: &AppState) {
     let config = load(state);
     if !config.enabled {
         stop_running(&state.mcp);
+        state.host.set_mcp_executable(None);
         ide_agent::set_mcp_executable(None);
         *state.mcp.error.lock() = None;
         return;
@@ -140,11 +142,12 @@ pub fn apply(state: &AppState) {
 
 /// Stops the server on exit (its discovery file goes with it).
 pub fn stop(state: &AppState) {
+    state.host.set_mcp_executable(None);
     ide_agent::set_mcp_executable(None);
     stop_running(&state.mcp);
 }
 
-/// What Settings › Tools › MCP Server shows.
+/// What Settings › Agents › MCP Server shows.
 #[derive(Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerStatus {

@@ -73,6 +73,14 @@
 .editorIsland {
   grid-area: editor;
 }
+.grid[data-maximized] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: none;
+}
+.grid[data-maximized] > [data-anchor] {
+  grid-area: 1 / 1;
+}
 
 /* A side: primary and split areas, each an island; stacked on the left and right, side by side at the bottom. */
 .side {
@@ -84,7 +92,8 @@
 .sideRow {
   flex-direction: row;
 }
-.island[hidden] {
+.island[hidden],
+.side[hidden] {
   display: none;
 }
 .side > .splitGap {
@@ -124,10 +133,10 @@
   grid-area: gap-bottom;
 }
 .gap[aria-orientation="vertical"] {
-  cursor: col-resize;
+  cursor: ew-resize;
 }
 .gap[aria-orientation="horizontal"] {
-  cursor: row-resize;
+  cursor: ns-resize;
 }
 /* A slightly wider hit area than the gap itself. */
 .gap::before {
@@ -200,7 +209,7 @@
   flex: none;
   width: 0;
   outline: none;
-  cursor: col-resize;
+  cursor: ew-resize;
 }
 .stripeHandle::before {
   content: "";

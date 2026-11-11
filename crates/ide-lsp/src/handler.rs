@@ -51,6 +51,7 @@ impl ClientHandler {
         let message = value.get("message").and_then(Value::as_str).map(str::to_owned);
         let fraction = value.get("percentage").and_then(Value::as_f64).map(|p| (p / 100.0).clamp(0.0, 1.0) as f32);
         let cancellable = value.get("cancellable").and_then(Value::as_bool);
+        let mut replaced = None;
         let event = {
             let mut progress = self.server.progress.lock();
             match value.get("kind").and_then(Value::as_str) {
@@ -64,7 +65,19 @@ impl ClientHandler {
                     let task = TaskId::next();
                     let cancel = (cancellable == Some(true)).then(|| self.cancel_handle(task, &params["token"]));
                     let cancellable = cancel.is_some();
-                    progress.insert(token, Progress { task, title: title.clone(), message: message.clone(), cancel });
+                    // A token carries one `begin`, yet servers reuse one for concurrent work
+                    // (PHPantom: begin, begin, end, end). The task it replaces ends now, or no
+                    // `end` would ever reach it.
+                    replaced = progress
+                        .insert(token, Progress { task, title: title.clone(), message: message.clone(), cancel })
+                        .map(|p| IdeEvent::Task {
+                            id: p.task,
+                            title: p.title,
+                            message: p.message,
+                            fraction: None,
+                            done: true,
+                            cancellable: false,
+                        });
                     IdeEvent::Task { id: task, title, message, fraction, done: false, cancellable }
                 }
                 Some("report") => {
@@ -102,7 +115,10 @@ impl ClientHandler {
                 _ => return,
             }
         };
-        let ended = matches!(&event, IdeEvent::Task { done: true, .. });
+        let ended = replaced.is_some() || matches!(&event, IdeEvent::Task { done: true, .. });
+        if let Some(replaced) = replaced {
+            self.server.emit(mgr.sink(), replaced);
+        }
         self.server.emit(mgr.sink(), event);
         self.server.refresh_busy_status(mgr.sink());
         if ended {
@@ -123,6 +139,19 @@ impl ClientHandler {
             }
         };
         let Some(path) = uri_to_path(params.uri.as_str()) else { return };
+        if self.server.name == "jdtls"
+            && let Some(body) = crate::jdtls::build_plan_failure(&path, &self.server.root, &params.diagnostics)
+            && mgr.first_message(&self.server.name, &body)
+        {
+            mgr.sink().emit(ide_core::IdeEvent::Notify {
+                level: ide_core::event::NotifyLevel::Error,
+                title: "Maven project could not be configured".into(),
+                body: Some(body),
+            });
+        }
+        if !mgr.accepts_injected_diagnostics(&path, params.version) {
+            return;
+        }
         // Files opened only for a request (references search) are not the user's problems.
         if (self.server.external_diagnostics.load(std::sync::atomic::Ordering::Acquire)
             && !mgr.docs.lock().values().any(|d| d.path == path))
@@ -249,6 +278,12 @@ impl Handler for ClientHandler {
             "window/showMessage" => self.show_message(&mgr, &params),
             "window/logMessage" => {
                 let text = params.get("message").and_then(Value::as_str).unwrap_or_default();
+                if self.server.name == "jdtls"
+                    && text.contains("Can't use Java ")
+                    && text.contains(" to import Gradle project ")
+                {
+                    self.show_message(&mgr, &json!({ "type": 1, "message": text.lines().next().unwrap_or(text) }));
+                }
                 match params.get("type").and_then(Value::as_u64) {
                     Some(1) if self.server.name == "jdtls" && text.contains(crate::jdtls::reserved_names::IMPORT_FAILURE) => {
                         tracing::warn!("[{}] {text}", self.server.name);
@@ -278,6 +313,7 @@ impl Handler for ClientHandler {
                 self.progress(&mgr, json!({ "token": ANGULAR_LOADING, "value": { "kind": "end" } }))
             }
             "telemetry/event" | "$/logTrace" | "$/cancelRequest" => {}
+            "eslint/status" | "eslint/probeFailed" | "eslint/exitCalled" => {}
             other => tracing::trace!("[{}] unhandled notification {other}", self.server.name),
         }
     }
@@ -318,6 +354,10 @@ impl Handler for ClientHandler {
                 Ok(Value::Null)
             }
             "workspace/inlineValue/refresh" => Ok(Value::Null),
+            // vscode-eslint asks its client before using the project's eslint (approved: 4) and
+            // reports a missing library or configuration; diagnostics already say what's wrong.
+            "eslint/confirmESLintExecution" => Ok(json!(4)),
+            "eslint/noLibrary" | "eslint/noConfig" | "eslint/openDoc" => Ok(json!({})),
             other => Err((codes::METHOD_NOT_FOUND, format!("unsupported method {other}"))),
         }
     }

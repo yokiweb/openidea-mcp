@@ -17,7 +17,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import type { CommitSelection, FileMatches, SearchQuery, RunConfig } from "@/bindings";
+import type { CommitSelection, FileMatches, SearchQuery, RunConfig, RunId } from "@/bindings";
 import type { MenuItem } from "@/ui/Menu";
 import type { DragData } from "@/ui/pointerDrag";
 import type { TreeReorder } from "@/ui/Tree";
@@ -58,6 +58,8 @@ export interface ToolWindowContribution {
    * present the header title also gets a "▾" opening just these items.
    */
   headerMenu?: MenuItem[] | ((id: string) => MenuItem[]);
+  /** `headerMenu` stays in "⋮" only: the title gets no "▾". */
+  plainTitle?: boolean;
   /**
    * The title as a view switcher (IDEA's "Project ▾" panes): a React hook
    * returning the current view's label and the items the title opens instead
@@ -117,6 +119,8 @@ export interface EditorKindContribution {
   component: ComponentType<{ input: EditorInput }>;
   title: (input: EditorInput) => string;
   icon?: (input: EditorInput) => string;
+  /** Small marker rendered in the tab's trailing slot (a status dot for live state). */
+  trailing?: (input: EditorInput) => ReactNode;
   /**
    * Its tabs are saved with the editor session and reopened with the project (their
    * `data` must be plain JSON). The editor closes tabs whose target is gone itself.
@@ -593,6 +597,10 @@ export interface EditorService {
   prepareClose?(): Promise<EditorCloseSession>;
   /** Backend project/window transition failed after authorization: resume its prepared documents. */
   cancelClose?(): void;
+  /** Drops this window's saved editor tabs so the next open does not restore them. */
+  forgetSavedTabs?(): void;
+  /** Writes them again when a close is cancelled after {@link forgetSavedTabs}. */
+  keepSavedTabs?(): void;
   /** Edit › Undo / Redo for a focused custom editor that has its own history; false when none takes it. */
   documentHistory?(command: "undo" | "redo"): boolean;
 }
@@ -633,6 +641,13 @@ export interface NotificationService {
      * `vcs`, `run`, `tools`, `plugins`, `search`, `updates`.
      */
     group?: string;
+    /**
+     * The notification answers a command the user just ran (Check for Updates
+     * and the install it offers). It pops up even when balloon notifications
+     * are turned off or its group's popup type is "No popup": those settings
+     * silence what the IDE reports on its own, not the answer to a request.
+     */
+    userInitiated?: boolean;
   }): void;
   /** Hides the balloon of the notification with `key` (it stays in the log), e.g. once its cause is gone. */
   expire?(key: string): void;
@@ -662,11 +677,25 @@ export type EmbeddedTerminalFactory = (
   options: EmbeddedTerminalOptions,
 ) => Promise<EmbeddedTerminal>;
 
+/**
+ * The output of Run sessions, by process: lets the Debug console of a debugger
+ * attached to a process the Run feature started (Maven, Gradle, Spring Boot…)
+ * show that process's output. Provided by the run feature.
+ */
+export interface RunOutputService {
+  /**
+   * Calls `listener` with the output so far, then with each new chunk, until the
+   * returned function is called. A process no Run session owns gets nothing.
+   */
+  subscribe(process: RunId, listener: (kind: "stdout" | "stderr" | "system", text: string) => void): () => void;
+}
+
 const services: {
   editor?: EditorService;
   toolWindows?: ToolWindowService;
   notifications?: NotificationService;
   embeddedTerminal?: EmbeddedTerminalFactory;
+  runOutput?: RunOutputService;
 } = {};
 
 function need<T>(s: T | undefined, name: string): T {
@@ -678,6 +707,7 @@ export const provideEditorService = (s: EditorService) => void (services.editor 
 export const provideToolWindowService = (s: ToolWindowService) => void (services.toolWindows = s);
 export const provideNotificationService = (s: NotificationService) => void (services.notifications = s);
 export const provideEmbeddedTerminal = (f: EmbeddedTerminalFactory | undefined) => void (services.embeddedTerminal = f);
+export const provideRunOutput = (s: RunOutputService | undefined) => void (services.runOutput = s);
 
 export const editorService = (): EditorService => need(services.editor, "editor");
 export const toolWindowService = (): ToolWindowService => need(services.toolWindows, "toolWindows");
@@ -687,6 +717,8 @@ export const notifications = (): NotificationService =>
 export const maybeEditorService = (): EditorService | undefined => services.editor;
 /** Creates terminal widgets; provided by the terminal feature. */
 export const embeddedTerminal = (): EmbeddedTerminalFactory | undefined => services.embeddedTerminal;
+/** Run output by process; provided by the run feature. */
+export const runOutput = (): RunOutputService | undefined => services.runOutput;
 
 /**
  * The commit being prepared (the Commit tool window or dialog), for plugins:
@@ -794,9 +826,18 @@ export function showFindResults(source: FindResultsSource) {
 // tree, editor tabs, Search Everywhere, etc. Providers (VCS status, problems)
 // push decorations into this store; consumers read with `useFileDecoration`.
 
+export interface DecorationSegment {
+  text: string;
+  icon?: string;
+  strike?: boolean;
+  label?: string;
+}
+
 export interface FileDecoration {
   /** CSS colour, normally a token like `var(--vcs-modified)`. */
   color?: string;
+  suffix?: readonly DecorationSegment[];
+  suffixColor?: string;
   /** CSS colour tinting the editor tab (a data source's colour on its console). */
   tint?: string;
   /** Short badge text, e.g. a problem count. */
@@ -1036,6 +1077,8 @@ export type ContextMenuId =
   | "editor"
   | "projectView"
   | "editorTab"
+  | "problems"
+  | "searchResults"
   | "editorGutter"
   | "openIn"
   | "stopProcess"
@@ -1078,6 +1121,8 @@ export interface MenuGroupContext {
   text?: string;
   /** Editor menu: 0-based caret line; gutter menu: the clicked line. */
   line?: number;
+  /** Zero-based UTF-16 column for problem/search result commands. */
+  column?: number;
   /** The tab's input, when the menu is for an editor tab without a path. */
   input?: EditorInput;
 }
@@ -1136,6 +1181,30 @@ export function provideProjectViewSelection(get: () => string[]): () => void {
 
 /** Selected project view paths (absolute); empty without a project view. */
 export const projectViewSelection = (): string[] => projectSelection?.() ?? [];
+
+/** The project view node the user last selected; `dir` decides the icon and popup of the last crumb. */
+export interface ProjectViewLead {
+  path: string;
+  dir: boolean;
+}
+
+/**
+ * The project view's current node, for the navigation bar: IDEA's bar shows the
+ * tree while that is the user's context and returns to the editor's file once the
+ * editor takes over (focus, tab switch). `null` = the editor is the context.
+ */
+export const useProjectViewLead = create<{ lead: ProjectViewLead | null }>(() => ({ lead: null }));
+
+export function setProjectViewLead(lead: ProjectViewLead | null) {
+  const prev = useProjectViewLead.getState().lead;
+  if (prev?.path === lead?.path && prev?.dir === lead?.dir) return;
+  useProjectViewLead.setState({ lead });
+}
+
+/** Hands the context back to the editor. */
+export function clearProjectViewLead() {
+  if (useProjectViewLead.getState().lead) useProjectViewLead.setState({ lead: null });
+}
 
 /** Runs the groups' `prepare` hooks, giving up after `timeoutMs` so the menu never waits long. */
 export async function prepareMenuGroups(menu: ContextMenuId, ctx: MenuGroupContext, timeoutMs = 200): Promise<void> {
@@ -1698,4 +1767,70 @@ export function registerDocumentIndexSync(sync: (path: string) => Promise<void>)
 }
 export async function synchronizeDocumentIndexes(path: string): Promise<void> {
   await Promise.all([...documentIndexSync].map((sync) => sync(path)));
+}
+
+/** Font zoom for non-CodeMirror surfaces, owned and released by their features. */
+const fontZoomSurfaces = new Map<Element, (delta: number) => void>();
+
+export function registerFontZoomSurface(host: Element, step: (delta: number) => void): () => void {
+  fontZoomSurfaces.set(host, step);
+  return () => {
+    fontZoomSurfaces.delete(host);
+  };
+}
+
+export function stepFocusedSurfaceFontZoom(delta: number): boolean {
+  const focused = document.activeElement;
+  for (const [host, step] of fontZoomSurfaces) {
+    if (focused && host.contains(focused)) {
+      step(delta);
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resetSurfaceFontZoom(): void {
+  for (const step of fontZoomSurfaces.values()) step(0);
+}
+
+/** Optional plugin test parser; the Run feature keeps the existing test tree. */
+type PluginTestParser = (config: string, chunk: string) => Promise<import("@/bindings").PluginTestEvent[] | null>;
+let pluginTestParser: PluginTestParser | null = null;
+export function providePluginTestParser(parser: PluginTestParser): () => void {
+  pluginTestParser = parser;
+  return () => {
+    if (pluginTestParser === parser) pluginTestParser = null;
+  };
+}
+export function parsePluginTests(config: string, chunk: string) {
+  return pluginTestParser?.(config, chunk) ?? Promise.resolve(null);
+}
+
+/** Optional selection support owned by the same host as the plugin test parser. */
+type PluginTestSelector = (config: string, tests: string[][]) => Promise<string[] | null>;
+let pluginTestSelector: PluginTestSelector | null = null;
+export function providePluginTestSelector(selector: PluginTestSelector): () => void {
+  pluginTestSelector = selector;
+  return () => {
+    if (pluginTestSelector === selector) pluginTestSelector = null;
+  };
+}
+export function selectPluginTests(config: string, tests: string[][]) {
+  return pluginTestSelector?.(config, tests) ?? Promise.resolve(null);
+}
+
+/** Read-only named snippets supplied by plugins. */
+export interface ContributedSnippet {
+  id: string;
+  pluginName: string;
+  language: string;
+  prefixes: string[];
+  body: string;
+  description: string;
+}
+export const useContributedSnippets = create<{ snippets: ContributedSnippet[] }>(() => ({ snippets: [] }));
+export function addContributedSnippets(snippets: ContributedSnippet[]): () => void {
+  useContributedSnippets.setState((s) => ({ snippets: [...s.snippets, ...snippets] }));
+  return () => useContributedSnippets.setState((s) => ({ snippets: s.snippets.filter((x) => !snippets.includes(x)) }));
 }

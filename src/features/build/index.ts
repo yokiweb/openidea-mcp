@@ -21,6 +21,7 @@ const WHEN = `projectOpen && !${BUILD_RUNNING}`;
 /** The module to build: the invoker's path (project view) or the active editor's file. */
 function moduleTarget(arg: unknown): string | null {
   if (typeof arg === "string" && arg) return arg;
+  if (typeof arg === "object" && arg !== null && "target" in arg && typeof arg.target === "string") return arg.target;
   return maybeEditorService()?.activePath() ?? null;
 }
 
@@ -79,8 +80,10 @@ export function activate(): () => void {
         when: WHEN,
         keywords: ["recompile", "compile file", "make module"],
         run: ({ arg }) => {
-          const target = moduleTarget(arg);
-          void startBuild("build", target);
+          const options = typeof arg === "object" && arg !== null ? arg : {};
+          const activate = !("activate" in options && options.activate === false);
+          const build = startBuild("build", moduleTarget(arg), activate);
+          if ("wait" in options && options.wait === true) return build.then(() => undefined);
         },
       },
       {
@@ -99,11 +102,16 @@ export function activate(): () => void {
       {
         id: "build.buildArtifacts",
         title: "Build Artifacts",
-        description: "Packages the project (mvn package, gradle assemble, cargo build --release, npm run build)",
+        description: "Packages the current module's artifacts, or the whole project when no file is active",
         category: "Build",
         when: WHEN,
-        keywords: ["package", "assemble", "jar", "release"],
-        run: () => void startBuild("artifacts"),
+        keywords: ["package", "assemble", "jar", "release", "module"],
+        run: ({ arg }) => {
+          const options = typeof arg === "object" && arg !== null ? arg : {};
+          const activate = !("activate" in options && options.activate === false);
+          const build = startBuild("artifacts", moduleTarget(arg), activate);
+          if ("wait" in options && options.wait === true) return build.then(() => undefined);
+        },
       },
       {
         id: "build.stop",

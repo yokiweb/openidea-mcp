@@ -24,7 +24,7 @@ import { registerLogPaneActions } from "./logPaneActions";
 import { controlLabel, controlOperation, inProgress } from "./operations";
 import { annotationsShown, blameSlot } from "./blame";
 import { inlineBlame } from "./inlineBlame";
-import { BranchWidget, useBranchesPopup } from "./BranchWidget";
+import { BranchWidget, BranchesPopupHost, useBranchesPopup } from "./BranchWidget";
 import { showConflictsDialog, takeContinueWhenResolved } from "./conflictsUi";
 import { registerCompareActions } from "./compare";
 import { DIFF_KIND, diffTitle, type DiffData } from "./diffInput";
@@ -47,6 +47,7 @@ import { installFileConfirmations } from "./confirmations";
 import { installIncomingCheck } from "./incoming";
 import { closeLogTab, installGitLog, selectGitTab, useGitLog } from "./logStore";
 import { installVcsStore, onConflictsAppeared, onConflictsCleared, useVcs } from "./store";
+import { installRootSync } from "./rootSync";
 import { tx } from "@/platform/i18n";
 
 /** The Resolve/Continue/Abort buttons exist in the title bar only while there is something to resolve. */
@@ -213,6 +214,7 @@ export function activate(): () => void {
   useCommit.setState({ signOff: workflowSettings().vcs.git.signOff });
   const disposers = [
     installVcsStore(),
+    installRootSync(),
     installGitLog(),
     installDiagnosticsTracking(),
     installPreparedMessage(),
@@ -238,6 +240,7 @@ export function activate(): () => void {
     trackMergeRebaseItem(),
     installHunkPopup(),
     registerOverlay({ id: "vcs.dialogs", component: VcsDialogHost }),
+    registerOverlay({ id: "vcs.branches", component: BranchesPopupHost }),
     activateConflictBanner(),
     activateConflictMarkers(),
     trackCommitWindow(),

@@ -1,4 +1,5 @@
 /** Editor actions (ids from keymaps/intellij-macos.ts). */
+import { writeClipboardText } from "@/platform/clipboard";
 import { EditorSelection, type EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { indentSelection, moveLineDown, moveLineUp } from "@codemirror/commands";
@@ -6,6 +7,8 @@ import { foldEffect, syntaxTree, toggleFold } from "@codemirror/language";
 import { acceptCompletion, completionStatus } from "@codemirror/autocomplete";
 import { executeAction, registerActions, type Action } from "@/platform/actions";
 import { getContext } from "@/platform/context";
+import { focusedSoftWrapSurface } from "@/workbench/softWrap";
+import { resetSurfaceFontZoom, stepFocusedSurfaceFontZoom } from "@/workbench/contributions";
 import { editorController, useGotoLine, useTabs } from "./controller";
 import {
   addCaretsToLineEnds,
@@ -67,8 +70,7 @@ import { copyReferenceToClipboard, declaredName, qualifiedReference, referenceOf
 import { declarationChain } from "./view/outline";
 import { recordClipboard } from "./clipboardHistory";
 import { useDocMeta, useOutline } from "./model/document";
-import { fontZoom, setFontZoom, stepFontZoom } from "./cm/prefs";
-import { useEditorRegistry } from "@/editor/api";
+import { resetAllEditorsFontZoom, stepAllEditorsFontZoom } from "./cm/prefs";
 import { useProject } from "@/platform/project";
 import { call, commands } from "@/platform/ipc";
 import { editorPrefs } from "@/platform/editorSettings";
@@ -107,6 +109,27 @@ function withView(run: (view: EditorView, slot: EditorSlot) => unknown) {
     run(slot.view, slot);
     if (!slot.view.hasFocus && !getContext().popupOpen) slot.view.focus();
   };
+}
+
+/** Routes keyboard font zoom to focus, then the active editor slot. */
+function stepSurfaceFontSize(delta: 1 | -1): void {
+  const activeEl = typeof document !== "undefined" ? (document.activeElement as HTMLElement | null) : null;
+  if (activeEl) {
+    if (stepFocusedSurfaceFontZoom(delta)) return;
+    const cmEl = activeEl.closest?.(".cm-editor") as HTMLElement | null;
+    if (cmEl) {
+      const cmView = EditorView.findFromDOM(cmEl);
+      if (cmView) {
+        stepAllEditorsFontZoom(cmView, delta);
+        return;
+      }
+    }
+  }
+
+  const slot = activeSlot();
+  if (!slot?.view) return;
+  stepAllEditorsFontZoom(slot.view, delta);
+  if (!slot.view.hasFocus && !getContext().popupOpen) slot.view.focus();
 }
 
 // --- extend / shrink selection ---------------------------------------------------
@@ -570,8 +593,7 @@ function copyPathReferencePopup(view: EditorView, slot: EditorSlot) {
 }
 
 function copyEditorPath(text: string) {
-  void navigator.clipboard
-    .writeText(text)
+  void writeClipboardText(text)
     .then(() => {
       recordClipboard(text);
       void executeAction("editor.showHint", { text: tx`Copied ${text}` });
@@ -716,9 +738,13 @@ export function registerEditorActions(): () => void {
       category: "View",
       icon: "soft-wrap",
       keywords: ["word wrap", "line wrap"],
-      when: "textEditorActive",
-      toggled: () => activeSlot()?.model.softWrapOn() ?? false,
-      run: () => activeSlot()?.model.toggleSoftWrap(),
+      when: "textEditorActive || softWrapSurfaceFocus",
+      toggled: () => focusedSoftWrapSurface()?.enabled() ?? activeSlot()?.model.softWrapOn() ?? false,
+      run: () => {
+        const surface = focusedSoftWrapSurface();
+        if (surface) surface.toggle();
+        else activeSlot()?.model.toggleSoftWrap();
+      },
     },
     text("code.foldAll", "Collapse All", (v) => collapseAll(v), { category: "Folding", icon: "collapse-all" }),
     text("code.unfoldAll", "Expand All", (v) => expandAll(v), { category: "Folding", icon: "expand-all" }),
@@ -784,6 +810,7 @@ export function registerEditorActions(): () => void {
       title: "Add or Remove Caret",
       category: "Editor Actions",
       when: "textEditorActive",
+      hidden: true,
       // The mouse selection style handles the pointer position and dragging.
       run: () => {},
     },
@@ -870,8 +897,10 @@ export function registerEditorActions(): () => void {
       keywords: ["zoom", "font size", "mouse wheel"],
       when: "projectOpen",
       run: () => {
-        for (const ed of useEditorRegistry.getState().editors)
-          if (ed.view.state.field(fontZoom, false)) ed.view.dispatch({ effects: setFontZoom.of(0) });
+        resetAllEditorsFontZoom();
+        if (typeof document !== "undefined") {
+          resetSurfaceFontZoom();
+        }
       },
     },
     {
@@ -879,16 +908,16 @@ export function registerEditorActions(): () => void {
       title: "Increase Font Size",
       category: "View",
       keywords: ["zoom", "font size"],
-      when: EDITOR_WHEN,
-      run: withView((view) => stepFontZoom(view, 1)),
+      when: "projectOpen",
+      run: () => stepSurfaceFontSize(1),
     },
     {
       id: "editor.decreaseFontSize",
       title: "Decrease Font Size",
       category: "View",
       keywords: ["zoom", "font size"],
-      when: EDITOR_WHEN,
-      run: withView((view) => stepFontZoom(view, -1)),
+      when: "projectOpen",
+      run: () => stepSurfaceFontSize(-1),
     },
     {
       id: "file.toggleReadOnly",
@@ -978,12 +1007,7 @@ export function registerEditorActions(): () => void {
       when: "projectOpen",
       // ⌘↑ / ⌘↓ inside a popup (Search Everywhere's previous / next group) stay with it.
       keyWhen: "!popupOpen",
-      run: () => {
-        if (activeSlot()) return openNavBarPopup();
-        // No editor: the status bar breadcrumbs (StatusItems › Breadcrumbs) take focus.
-        const crumbs = document.querySelectorAll<HTMLButtonElement>('nav[aria-label="Breadcrumbs"] button');
-        crumbs[crumbs.length - 1]?.focus();
-      },
+      run: () => openNavBarPopup(),
     },
     {
       id: "navigate.lastEditLocation",

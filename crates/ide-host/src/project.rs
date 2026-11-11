@@ -13,9 +13,11 @@ use ide_vfs::Watcher;
 use ide_workspace::documents::DocumentObserver;
 use ide_workspace::{DocumentInfo, Documents, FileMoves, LocalHistory, ProjectRoots, SettingsStore, SourceFolder};
 use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Everything bound to one open project folder.
 pub struct Project {
@@ -83,7 +85,7 @@ impl Host {
         let opening = self.opening(window);
         let _opening = opening.lock();
         // Reject a damaged manifest before replacing the currently open project.
-        ide_workspace::workspace::Workspace::load(&root)?;
+        let is_workspace = ide_workspace::workspace::Workspace::load(&root)?.is_some();
         // The window reloaded (or asked again) for the project it already has: keep
         // it, with its warm index, language servers and unsaved documents.
         if let Ok(current) = self.project(window)
@@ -96,7 +98,7 @@ impl Host {
         self.wait_detached_closes();
         let sink: SharedSink = (self.sink_for)(window);
         // Before anything the project starts: its children get the project's environment.
-        let trusted = Arc::new(AtomicBool::new(self.trust.trusted(&root)?));
+        let trusted = Arc::new(AtomicBool::new(self.trust.window_trusted(&root)?));
         let post_start =
             trusted.load(Ordering::Acquire).then(|| self.environment.project_opened(&root, &sink)).flatten();
         let settings = SettingsStore::load(&self.config_dir, Some(&root));
@@ -133,9 +135,17 @@ impl Host {
         )?;
         mark("index");
         let lsp = LspManager::new(root.clone(), languages.clone(), sink.clone());
+        crate::plugins::injections::configure_lsp(&lsp);
         lsp.set_execution_allowed(trusted.load(Ordering::Acquire));
         lsp.set_content_roots(extra_roots.clone());
         let settings = Arc::new(settings);
+        {
+            let settings = settings.clone();
+            // Workspace members have independent settings.
+            lsp.set_jdtls_shared_hook(Box::new(move || {
+                !is_workspace && settings.effective().languages.java.jdtls_shared
+            }));
+        }
         {
             let settings = settings.clone();
             let root = root.clone();
@@ -152,14 +162,15 @@ impl Host {
                     .as_ref()
                     .map(|p| SettingsStore::load(&config_dir, Some(p)).effective())
                     .unwrap_or_else(|| settings.effective());
-                let root = member.as_ref().unwrap_or(&root);
+                let window_root = &root;
+                let root = member.as_ref().unwrap_or(window_root);
                 ide_sdk::apply::server_launch_overrides(cfg, &effective);
                 ide_sdk::apply::configure_server(cfg, root, server_root, &effective);
                 if cfg.name == "jdtls" {
                     // A workspace member keeps its build model under its own key (Build Project).
                     let cache = match &member {
-                        Some(member) => build_cache.join(crate::project::project_key(member)),
-                        None => build_cache.clone(),
+                        Some(member) if member != window_root => build_cache.join(crate::project::project_key(member)),
+                        _ => build_cache.clone(),
                     };
                     let profiles = ide_build::maven_profiles(&cache);
                     ide_sdk::maven_profiles::configure_jdtls(cfg, root, &effective, &profiles, &cache);
@@ -349,6 +360,7 @@ impl Host {
                 Box::new(move |batch| {
                     let changed: Vec<PathBuf> = batch.created.iter().chain(&batch.modified).cloned().collect();
                     let (ignored, ignored_gone) = ignored_changes(batch);
+                    index.ignore_rules_changed(&batch.ignore_rules);
                     index.update(&[&changed[..], &ignored].concat(), &[&batch.removed[..], &ignored_gone].concat());
                     kotlin_bridge.files_changed(changed.iter().chain(&batch.removed));
                     phpstan.files_removed(batch.removed.iter());
@@ -519,7 +531,7 @@ impl Host {
         mark("git");
         tracing::info!("opened {} in window {window} in {} ms {laps:?}", root.display(), started.elapsed().as_millis());
 
-        let (db, http_history, agents) = self.project_services(&root, &project_key);
+        let (db, http_history, agents) = self.project_services(&root, &project_key, &settings);
         let notebooks = crate::notebook::NotebookService::new(
             self.local_data_dir.join("notebook-runtime").join(uuid::Uuid::new_v4().to_string()),
             sink.clone(),
@@ -601,6 +613,7 @@ impl Host {
         &self,
         root: &Path,
         project_key: &str,
+        settings: &Arc<SettingsStore>,
     ) -> (Arc<ide_db::DbManager>, Arc<ide_http::History>, Arc<ide_agent::AgentManager>) {
         let db = Arc::new(
             ide_db::DbManager::new(
@@ -630,6 +643,10 @@ impl Host {
             },
             self.runtime.clone(),
         ));
+        let settings = settings.clone();
+        agents.set_mcp_servers_hook(Box::new(move || {
+            ide_agent::mcp::servers_from_settings(&Default::default(), &settings.effective().agents.mcp_servers)
+        }));
         (db, http_history, agents)
     }
 }
@@ -671,7 +688,7 @@ impl Host {
         documents.add_observer(Arc::new(HistoryObserver(history.clone())));
         let watcher = light_watcher(&dir, &sink, &documents, &history)?;
         let project_key = project_key(&dir);
-        let (db, http_history, agents) = self.project_services(&dir, &project_key);
+        let (db, http_history, agents) = self.project_services(&dir, &project_key, &settings);
         let notebooks = crate::notebook::NotebookService::new(
             self.local_data_dir.join("notebook-runtime").join(uuid::Uuid::new_v4().to_string()),
             sink.clone(),
@@ -1017,12 +1034,13 @@ impl Project {
         let Some(root) = root else {
             return ide_lsp::CandidateFiles::default();
         };
-        let query = ide_search::WordQuery {
-            word: q.word.clone(),
-            dir: q.root.clone(),
-            exclude: self.search_excludes(),
-            limit: q.limit,
-        };
+        let mut exclude = self.search_excludes();
+        // Directories the server analyses fully: their files are never read.
+        exclude.extend(q.skip.iter().filter_map(|dir| {
+            let rel = dir.strip_prefix(&root).ok()?.to_str()?.replace('\\', "/");
+            (!rel.is_empty() && !rel.contains(['*', '?', '[', ']', '{', '}', '!', ','])).then(|| format!("{rel}/**"))
+        }));
+        let query = ide_search::WordQuery { word: q.word.clone(), dir: q.root.clone(), exclude, limit: q.limit };
         let filter = |rel: &str| q.languages.contains(&self.languages.detect(&root.join(rel), None));
         match ide_search::files_with_word(&root, &query, Some(&filter), &|p| self.documents.search_text_of(p), cancel) {
             Ok(found) => ide_lsp::CandidateFiles { files: found.files, limit_hit: found.limit_hit },
@@ -1161,19 +1179,106 @@ pub fn history_retention(settings: &ide_core::settings::Settings) -> ide_workspa
     }
 }
 
-/// A workspace uses its root only for state, never as indexed content.
+/// Only explicit workspace containers exclude their root from indexed content.
 fn index_roots(root: &Path, folders: Vec<PathBuf>) -> ide_index::IndexRoots {
-    ide_index::IndexRoots { include_root: !root.join(ide_workspace::workspace::FILE).is_file(), folders }
+    let container =
+        ide_workspace::workspace::Workspace::load(root).ok().flatten().is_some_and(|w| w.is_container(root));
+    ide_index::IndexRoots { include_root: !container, folders: folders.into_iter().filter(|p| p != root).collect() }
 }
 
 /// Workspace members in manifest order, or extra Project Structure directories and the
 /// Gradle project folders outside the project as of the last sync (`build_cache`).
 fn content_roots(settings: &ide_core::settings::Settings, root: &Path, build_cache: &Path) -> Vec<PathBuf> {
     if let Ok(Some(workspace)) = ide_workspace::workspace::Workspace::load(root) {
-        return workspace.projects;
+        if workspace.is_container(root) {
+            return workspace.projects;
+        }
+        let mut roots = workspace.projects.into_iter().filter(|p| !p.starts_with(root)).collect::<Vec<_>>();
+        for path in extra_content_roots(settings, root, build_cache) {
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+        return roots;
     }
+    extra_content_roots(settings, root, build_cache)
+}
+
+/// The roots a file may navigate into: its own root (the workspace member containing it, or
+/// the project root) plus that root's configured dependencies. A workspace member depends
+/// only on the roots picked per member in Settings › Project Structure › Dependencies —
+/// being attached to the workspace never makes its code navigable by itself.
+/// Cached navigation roots per (project, file), with the instant they were computed.
+type NavigationRootsCache = HashMap<(PathBuf, PathBuf), (Instant, Vec<PathBuf>)>;
+
+pub(crate) fn navigation_roots(project: &Project, from: &Path) -> Vec<PathBuf> {
+    // Hover probes and import-segment clicks repeat these lookups for the same file,
+    // and each uncached call re-reads the workspace file: memoize briefly. The short
+    // TTL keeps settings and workspace edits near-immediate.
+    static CACHE: Mutex<Option<NavigationRootsCache>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(1);
+    const CAP: usize = 256;
+    let key = (project.root.clone(), from.to_path_buf());
+    if let Some((at, roots)) = CACHE.lock().as_ref().and_then(|m| m.get(&key))
+        && at.elapsed() < TTL
+    {
+        return roots.clone();
+    }
+    let roots = navigation_roots_uncached(project, from);
+    if let Some(map) = CACHE.lock().as_mut() {
+        if map.len() >= CAP {
+            map.retain(|_, (at, _)| at.elapsed() < TTL);
+        }
+        map.insert(key, (Instant::now(), roots.clone()));
+    }
+    roots
+}
+
+fn navigation_roots_uncached(project: &Project, from: &Path) -> Vec<PathBuf> {
+    let settings = project.settings.effective();
+    let workspace = ide_workspace::workspace::Workspace::load(&project.root).ok().flatten();
+    let own = workspace
+        .as_ref()
+        .and_then(|w| w.projects.iter().filter(|p| from.starts_with(p)).max_by_key(|p| p.components().count()).cloned())
+        .unwrap_or_else(|| project.root.clone());
+    let mut roots = vec![own.clone()];
+    let own_key = ide_core::ipc_path::to_ipc(&own);
+    if let Some(deps) = member_dependencies_for(&settings.project_structure.member_dependencies, &own_key) {
+        for dep in deps {
+            let dep = PathBuf::from(dep.trim());
+            if dep.is_absolute() && dep.is_dir() && !roots.contains(&dep) {
+                roots.push(dep);
+            }
+        }
+    }
+    if workspace.is_none() {
+        for root in content_roots(&settings, &project.root, &project.build_cache_dir()) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+/// The dependency roots configured for `own`, keyed by IPC path. The settings UI writes
+/// keys as it received the member paths (IPC form); a hand-edited settings.toml may not,
+/// so compare normalized rather than only by exact match.
+fn member_dependencies_for<'a>(map: &'a BTreeMap<String, Vec<String>>, own_key: &str) -> Option<&'a Vec<String>> {
+    if let Some(deps) = map.get(own_key) {
+        return Some(deps);
+    }
+    map.iter().find(|(key, _)| ide_core::ipc_path::to_ipc(&PathBuf::from(key)) == own_key).map(|(_, deps)| deps)
+}
+
+fn extra_content_roots(settings: &ide_core::settings::Settings, root: &Path, build_cache: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let user = settings.project_structure.content_roots.iter().map(|r| PathBuf::from(r.trim()));
+    let user = settings
+        .project_structure
+        .content_roots
+        .iter()
+        .chain(settings.project_structure.dependencies.iter())
+        .map(|r| PathBuf::from(r.trim()));
     for p in user.chain(ide_build::gradle_external_roots(root, build_cache, &settings.languages.java.gradle)) {
         if p.is_absolute() && p.is_dir() && !p.starts_with(root) && !out.contains(&p) {
             out.push(p);
@@ -1230,6 +1335,7 @@ fn content_root_watcher(
         Box::new(move |batch| {
             let changed: Vec<PathBuf> = batch.created.iter().chain(&batch.modified).cloned().collect();
             let (ignored, ignored_gone) = ignored_changes(batch);
+            index.ignore_rules_changed(&batch.ignore_rules);
             index.update(&[&changed[..], &ignored].concat(), &[&batch.removed[..], &ignored_gone].concat());
             // A workspace member's PHP language level follows its own composer.json.
             if composer_changed(&root, changed.iter().chain(&batch.removed)) {
@@ -1782,5 +1888,36 @@ mod composer_tests {
         assert!(changed(&["src/a.php", "composer.json"]));
         assert!(!changed(&["composer.lock", "vendor/acme/lib/composer.json", "packages/b/composer.json"]));
         assert!(!changed(&[]));
+    }
+}
+
+#[cfg(test)]
+mod content_roots_tests {
+    use super::content_roots;
+
+    #[test]
+    #[cfg(windows)]
+    fn member_dependencies_match_hand_written_keys() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("B:\\proj\\member".to_string(), vec!["B:/dep".to_string()]);
+        let deps = super::member_dependencies_for(&map, "B:/proj/member");
+        assert_eq!(deps.map(Vec::as_slice), Some(["B:/dep".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn dependency_projects_join_the_content_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let shared = tmp.path().join("shared");
+        let dep = tmp.path().join("lib");
+        for dir in [&root, &shared, &dep] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut settings = ide_core::settings::Settings::default();
+        settings.project_structure.content_roots = vec![shared.to_string_lossy().into_owned()];
+        settings.project_structure.dependencies =
+            vec![dep.to_string_lossy().into_owned(), root.to_string_lossy().into_owned()];
+        let roots = content_roots(&settings, &root, &tmp.path().join("build"));
+        assert_eq!(roots, vec![shared, dep]);
     }
 }

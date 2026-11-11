@@ -3,10 +3,12 @@
  * common ones, the options added through "Modify options" (⌥M) and the
  * Before launch list.
  */
-import { parseJavaArgs } from "@/platform/javaLaunch";
+import { writeClipboardText } from "@/platform/clipboard";
+import { isJvmApplication, parseJavaArgs } from "@/platform/javaLaunch";
+import { useRunTargets } from "@/platform/pluginRunTargets";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import clsx from "clsx";
-import { isTauri, type BeforeLaunchTask, type RunConfig } from "@/platform/ipc";
+import { isTauri, type BeforeLaunchTask, type BuildPolicy, type RunConfig } from "@/platform/ipc";
 import { useWorkflowSettings } from "@/platform/workflowSettings";
 import { relativePath, useProject } from "@/platform/project";
 import { isRemoteWindow } from "@/platform/remote";
@@ -42,8 +44,9 @@ import {
   parseEnv,
   type ConfigErrors,
 } from "./configs";
+import { gradleContainsModule } from "./gradleRun";
 import { EnvDialog } from "./EnvDialog";
-import { withTarget } from "./remote";
+import { useBuildModel } from "@/platform/buildModel";
 import { COMPOUND, formParams, terminalApplies, withParams } from "./types";
 import { TomcatSettings } from "./TomcatSettings";
 import styles from "./Run.module.css";
@@ -63,7 +66,9 @@ const ADAPTERS: ReadonlyArray<{ id: string; label: string }> = [
   { id: "delve", label: "Delve (Go)" },
   { id: "codelldb", label: "CodeLLDB (Rust, C, C++)" },
   { id: "lldb-dap", label: "lldb-dap (C, C++, Swift)" },
+  { id: "gdb", label: "GDB (C, C++)" },
   { id: "php-debug", label: "php-debug (PHP)" },
+  { id: "rdbg", label: "rdbg (Ruby)" },
 ];
 
 /** Options "Modify options" adds to the form: value fields (shown once added) and flags (chips). */
@@ -75,12 +80,19 @@ export type OptionId =
   | "showOnStdout"
   | "showOnStderr"
   | "beforeLaunch"
+  | "buildPolicy"
   | "openToolWindow"
   | "focusToolWindow"
   | "isTest"
   | "emulateTerminal";
 
-const VALUE_OPTIONS: ReadonlySet<OptionId> = new Set(["stdinFile", "envFiles", "outputFile", "beforeLaunch"]);
+const VALUE_OPTIONS: ReadonlySet<OptionId> = new Set([
+  "stdinFile",
+  "envFiles",
+  "outputFile",
+  "beforeLaunch",
+  "buildPolicy",
+]);
 
 const OPTION_LABELS: Record<OptionId, string> = {
   allowParallel: "Allow multiple instances",
@@ -90,6 +102,7 @@ const OPTION_LABELS: Record<OptionId, string> = {
   showOnStdout: "Show console when a message is printed to stdout",
   showOnStderr: "Show console when a message is printed to stderr",
   beforeLaunch: "Add before launch task",
+  buildPolicy: "Build",
   openToolWindow: "Open run/debug tool window when started",
   focusToolWindow: "Focus run/debug tool window when started",
   isTest: "Show results in the test runner",
@@ -100,7 +113,11 @@ const OPTION_GROUPS: ReadonlyArray<{ label: string; options: OptionId[]; process
   { label: "Operating System", options: ["allowParallel", "stdinFile", "envFiles", "emulateTerminal"], process: true },
   { label: "Logs", options: ["outputFile", "showOnStdout", "showOnStderr"], process: true },
   { label: "Test", options: ["isTest"], process: true },
-  { label: "Before Launch", options: ["beforeLaunch", "openToolWindow", "focusToolWindow"], process: false },
+  {
+    label: "Before Launch",
+    options: ["buildPolicy", "beforeLaunch", "openToolWindow", "focusToolWindow"],
+    process: false,
+  },
 ];
 
 /** Whether the option currently has a (non-default) value. */
@@ -120,6 +137,8 @@ export function optionSet(config: RunConfig, id: OptionId, openByDefault: boolea
       return !!config.showOnStderr;
     case "beforeLaunch":
       return !!config.beforeLaunch?.length;
+    case "buildPolicy":
+      return (config.buildPolicy ?? "automatic") !== "automatic";
     case "openToolWindow":
       return config.openToolWindow ?? openByDefault;
     case "focusToolWindow":
@@ -144,6 +163,8 @@ export function optionPatch(id: OptionId, on: boolean): Partial<RunConfig> {
       return { outputFile: null };
     case "beforeLaunch":
       return { beforeLaunch: [] };
+    case "buildPolicy":
+      return { buildPolicy: on ? "automatic" : null };
     case "showOnStdout":
       return { showOnStdout: on };
     case "showOnStderr":
@@ -158,6 +179,14 @@ export function optionPatch(id: OptionId, on: boolean): Partial<RunConfig> {
       return { emulateTerminal: on };
   }
 }
+
+const BUILD_POLICY_OPTIONS: SelectOption[] = [
+  { value: "automatic", label: "Automatic (incremental)" },
+  { value: "make", label: "Build (Make)" },
+  { value: "rebuild", label: "Rebuild" },
+  { value: "noBuild", label: "No build" },
+  { value: "makeAndContinueOnErrors", label: "Build, no error check" },
+];
 
 export interface ConfigFormProps {
   config: RunConfig;
@@ -216,11 +245,22 @@ function BrowseButton({
 export function ConfigForm({ config, all, type, errors, template, onChange, modifyRequest }: ConfigFormProps) {
   const openByDefault = useWorkflowSettings((s) => s.run.showOnStart);
   const externalTools = useWorkflowSettings((s) => s.externalTools);
-  const runTargets = useWorkflowSettings((s) => s.runTargets);
+  const runTargets = useRunTargets();
   const toolWindows = useContributions((s) => s.toolWindows);
   const tx = useTx();
   const txTemplate = useTxTemplate();
   const root = useProject((s) => s.project?.root ?? null);
+  const gradle = useBuildModel((s) => s.model?.gradle);
+  const runUsing = useProject((s) => s.settings?.languages?.java?.gradle?.runUsing);
+  const delegated =
+    isJvmApplication(config) &&
+    runUsing !== "ide" &&
+    gradle?.some((g) => config.module == null || gradleContainsModule(g, root ?? "", config.module));
+  const buildPolicyOptions = BUILD_POLICY_OPTIONS.filter((option) => {
+    if (config.kind === "gradle" || delegated)
+      return option.value !== "noBuild" && option.value !== "makeAndContinueOnErrors";
+    return config.kind !== "maven" || option.value !== "noBuild";
+  });
   const [shown, setShown] = useState<ReadonlySet<OptionId>>(() => new Set());
   const [argsText, setArgsText] = useState<string | null>(null);
   const [envText, setEnvText] = useState<string | null>(null);
@@ -238,6 +278,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
   }
 
   const compound = config.kind === COMPOUND;
+  const buildPolicyApplies = (c: RunConfig) => isJvmApplication(c) || c.kind === "maven" || c.kind === "gradle";
   // Compound and debug-only types (Remote JVM Debug) start no process of their own.
   const noProcess = compound || !!type?.debugOnly;
   const params = compound ? {} : formParams(config, type);
@@ -274,7 +315,9 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
     ...g.options
       .filter(
         (id) =>
-          (!compound || id === "beforeLaunch") && (id !== "emulateTerminal" || terminal || !!config.emulateTerminal),
+          (!compound || id === "beforeLaunch") &&
+          (id !== "emulateTerminal" || terminal || !!config.emulateTerminal) &&
+          (id !== "buildPolicy" || buildPolicyApplies(config)),
       )
       .map((id): MenuItem => ({
         label: OPTION_LABELS[id],
@@ -300,6 +343,13 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
       })),
     },
     { label: TASK_LABELS.build, icon: "build-project", run: () => addTask("build") },
+    {
+      label: TASK_LABELS.buildModule,
+      icon: "build-project",
+      disabled: config.module == null,
+      run: () => addTask("buildModule", config.module ?? ""),
+    },
+    { label: TASK_LABELS.buildArtifacts, icon: "build-rebuild", run: () => addTask("buildArtifacts") },
     ...(config.kind === "dotnet"
       ? [{ label: TASK_LABELS.dotnetBuild, icon: "build-project", run: () => addTask("dotnetBuild") }]
       : []),
@@ -326,7 +376,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
 
   const adapterOptions: SelectOption[] = [
     { value: "", label: "None" },
-    ...ADAPTERS.map((a) => ({ value: a.id, label: a.label })),
+    ...ADAPTERS.map((a) => ({ value: a.id, label: tx(a.label) })),
   ];
   if (config.debugAdapter && !ADAPTERS.some((a) => a.id === config.debugAdapter))
     adapterOptions.push({
@@ -335,6 +385,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
     });
 
   const targetOptions: SelectOption[] = [
+    { value: "__default", label: "Default run target" },
     { value: "", label: "Local machine" },
     ...runTargets.map((t) => ({ value: t.id, label: t.name.trim() || t.id })),
   ];
@@ -356,7 +407,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
   );
 
   return (
-    <>
+    <div className={clsx(styles.configFields, config.kind === "tomcat" && styles.configFieldsTomcat)}>
       {config.detected && !template && (
         <div className={styles.notice}>
           <T>Detected from the project. Changes are saved as a user configuration that overrides it.</T>
@@ -365,21 +416,23 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
       {!template && (
         <div className={clsx(styles.formHeader, config.kind === "tomcat" && styles.formHeaderTomcat)}>
           <Field label={config.kind === "tomcat" ? "Name:" : "Name"} error={errors.name}>
-            <Input
-              value={config.name}
-              invalid={!!errors.name}
-              aria-label="Name"
-              onChange={(e) => update({ name: e.target.value })}
-            />
+            <div className={styles.nameControl}>
+              <Input
+                value={config.name}
+                invalid={!!errors.name}
+                aria-label="Name"
+                onChange={(e) => update({ name: e.target.value })}
+              />
+              <div className={styles.storeProjectGroup}>
+                <Checkbox
+                  checked={!config.local}
+                  onChange={(shared) => update({ local: !shared })}
+                  label="Store as project file"
+                  aria-label="Store as project file (.openidea/run.toml); otherwise in the workspace (.openidea/run.local.toml)"
+                />
+              </div>
+            </div>
           </Field>
-          <div className={styles.storeProjectGroup}>
-            <Checkbox
-              checked={!config.local}
-              onChange={(shared) => update({ local: !shared })}
-              label="Store as project file"
-              aria-label="Store as project file (.openidea/run.toml); otherwise in the workspace (.openidea/run.local.toml)"
-            />
-          </div>
         </div>
       )}
       {config.kind === "tomcat" ? (
@@ -398,9 +451,14 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
               }
             >
               <Select
-                value={config.target ?? ""}
+                value={config.target ?? "__default"}
                 options={targetOptions}
-                onChange={(target) => onChange(withTarget(config, target))}
+                onChange={(target) => {
+                  if (target === "__default") {
+                    const { target: _target, ...rest } = config;
+                    onChange(rest);
+                  } else onChange({ ...config, target });
+                }}
                 aria-label="Run on"
               />
             </Field>
@@ -621,6 +679,17 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
             </>
           )}
 
+          {isShown("buildPolicy") && buildPolicyApplies(config) && (
+            <Field label="Build" hint="Before launch build for this Java configuration">
+              <Select
+                value={config.buildPolicy ?? "automatic"}
+                options={buildPolicyOptions}
+                onChange={(v) => update({ buildPolicy: v === "automatic" ? null : (v as BuildPolicy) })}
+                aria-label="Build"
+              />
+            </Field>
+          )}
+
           {isShown("beforeLaunch") && (
             <Field label="Before launch" error={errors.beforeLaunch} top>
               <div className={styles.taskList} role="list" aria-label={tx("Before launch tasks")}>
@@ -637,31 +706,35 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
                         }
                       />
                     ) : (
-                      <span className={styles.taskLabel}>{txTemplate(taskLabel(t, all))}</span>
+                      <span className={styles.taskLabel} title={txTemplate(taskLabel(t, all))}>
+                        {txTemplate(taskLabel(t, all))}
+                      </span>
                     )}
-                    <IconButton
-                      icon="arrow-up"
-                      size="small"
-                      iconSize={12}
-                      title="Move Up"
-                      disabled={i === 0}
-                      onClick={() => moveTask(i, -1)}
-                    />
-                    <IconButton
-                      icon="arrow-down"
-                      size="small"
-                      iconSize={12}
-                      title="Move Down"
-                      disabled={i === tasks.length - 1}
-                      onClick={() => moveTask(i, 1)}
-                    />
-                    <IconButton
-                      icon="minus"
-                      size="small"
-                      iconSize={12}
-                      title="Remove Task"
-                      onClick={() => setTasks(tasks.filter((_, j) => j !== i))}
-                    />
+                    <span className={styles.taskActions}>
+                      <IconButton
+                        icon="arrow-up"
+                        size="small"
+                        iconSize={12}
+                        title="Move Up"
+                        disabled={i === 0}
+                        onClick={() => moveTask(i, -1)}
+                      />
+                      <IconButton
+                        icon="arrow-down"
+                        size="small"
+                        iconSize={12}
+                        title="Move Down"
+                        disabled={i === tasks.length - 1}
+                        onClick={() => moveTask(i, 1)}
+                      />
+                      <IconButton
+                        icon="minus"
+                        size="small"
+                        iconSize={12}
+                        title="Remove Task"
+                        onClick={() => setTasks(tasks.filter((_, j) => j !== i))}
+                      />
+                    </span>
                   </div>
                 ))}
                 <Button
@@ -718,7 +791,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
           )}
         </>
       )}
-    </>
+    </div>
   );
 }
 
@@ -822,8 +895,7 @@ function OutputField({ label, text }: { label: string; text: string }) {
   const tx = useTx();
   const [copied, setCopied] = useState(false);
   const copy = () => {
-    void navigator.clipboard
-      ?.writeText(text)
+    void writeClipboardText(text)
       .then(() => setCopied(true))
       .catch(() => undefined);
   };

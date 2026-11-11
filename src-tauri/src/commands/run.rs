@@ -99,11 +99,12 @@ pub async fn run_start(
     state: State<'_, AppState>,
     config: RunConfig,
     on_output: Channel<OutputChunk>,
+    request: Option<ide_core::RequestId>,
 ) -> IdeResult<RunInfo> {
     let emit = std::sync::Arc::new(move |chunk| {
         let _ = on_output.send(chunk);
     });
-    ide_host::ops::run::start(&state.host, window.label(), config, emit).await
+    ide_host::ops::run::start_request(&state.host, window.label(), config, emit, request).await
 }
 
 #[tauri::command]
@@ -176,6 +177,17 @@ pub fn run_import_configs(
 #[specta::specta]
 pub fn run_system_env(state: State<'_, AppState>) -> std::collections::BTreeMap<String, String> {
     ide_host::ops::run::run_system_env(&state.host, "")
+}
+
+/// Variables of the `.env` files a debug launch names, for the debugger to start with.
+#[tauri::command]
+#[specta::specta]
+pub fn run_env_files(
+    window: Window,
+    state: State<'_, AppState>,
+    files: Vec<std::path::PathBuf>,
+) -> IdeResult<std::collections::BTreeMap<String, String>> {
+    ide_host::ops::run::run_env_files(&state.host, window.label(), files)
 }
 
 /// Writes the Gradle init script adding `jvm_args` to the JVMs the build forks; returns its path.

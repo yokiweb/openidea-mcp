@@ -91,7 +91,15 @@ async fn resolve_java_command(host: &Host, window: &str, config: &RunConfig) -> 
     let test = config.args.iter().any(|a| a == "${testClasspath}");
     let request = ide_core::RequestId::next();
     let info =
-        crate::ops::java::java_resolve_launch(host, window, std::path::PathBuf::from(module), test, true, request)
+        // 上游 v0.1.41 把 `build: bool` 换成 BuildPolicy；默认策略等价原来的 build=true。
+        crate::ops::java::java_resolve_launch(
+            host,
+            window,
+            std::path::PathBuf::from(module),
+            test,
+            ide_run::BuildPolicy::default(),
+            request,
+        )
             .await
             .map_err(err)?;
     if info.class_paths.is_empty() {

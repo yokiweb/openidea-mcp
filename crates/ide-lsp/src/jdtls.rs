@@ -478,6 +478,17 @@ pub fn parse_classpaths(v: &Value) -> JavaClasspath {
     }
 }
 
+/// Folders of `cp` inside the project that don't exist: build outputs deleted outside
+/// the IDE. Archives and folders outside the project (dependencies) are left out.
+fn missing_outputs(cp: &JavaClasspath, project_root: &Path) -> Vec<PathBuf> {
+    cp.class_paths
+        .iter()
+        .chain(&cp.module_paths)
+        .map(PathBuf::from)
+        .filter(|p| p.starts_with(project_root) && p.extension().is_none() && !p.exists())
+        .collect()
+}
+
 /// `vscode.java.startDebugSession` answers the port as a number (or numeric string).
 pub fn parse_port(v: &Value) -> Option<u16> {
     v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).and_then(|p| u16::try_from(p).ok())
@@ -627,7 +638,11 @@ impl LspManager {
             .docs
             .lock()
             .values()
-            .filter(|d| d.language.as_str() == "java" && d.path.starts_with(&server.root))
+            .filter(|d| {
+                d.language.as_str() == "java"
+                    && d.path.is_absolute()
+                    && d.servers.iter().any(|a| a.server.id == server.id)
+            })
             .map(|d| crate::uri::path_to_uri_string(&d.path))
             .collect();
         if uris.is_empty() {
@@ -652,26 +667,50 @@ impl LspManager {
     /// started if needed and waited for.
     async fn jdtls(&self, path: &Path, cancel: &CancellationToken) -> IdeResult<(Arc<Server>, Running)> {
         let java = LanguageId::new("java");
-        let server = self
-            .servers_for(&java, path)
-            .into_iter()
-            .find(|s| s.name == SERVER)
-            .ok_or_else(|| IdeError::unavailable("no Java language server (jdtls) is configured"))?;
-        self.ensure_started(&server);
-        match cancellable_wait(cancel, server.wait_ready(READY_TIMEOUT)).await? {
-            Some(run) => Ok((server, run)),
-            None => {
-                let status = server.status();
-                Err(IdeError::unavailable(match status {
-                    ide_core::event::ServerStatus::Missing => {
-                        "jdtls is not installed (Settings › Languages & Frameworks › Language Servers)".to_owned()
-                    }
-                    ide_core::event::ServerStatus::Misconfigured | ide_core::event::ServerStatus::Crashed => {
-                        server.status_message().unwrap_or_else(|| "jdtls cannot start".to_owned())
-                    }
-                    _ => format!("jdtls is not ready ({status:?})"),
-                }))
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(IdeError::cancelled());
             }
+            let server = self
+                .servers_for(&java, path)
+                .into_iter()
+                .find(|s| s.name == SERVER)
+                .ok_or_else(|| IdeError::unavailable("no Java language server (jdtls) is configured"))?;
+            self.ensure_started(&server);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let Some(run) = cancellable_wait(cancel, server.wait_ready(remaining)).await? {
+                return Ok((server, run));
+            }
+            let status = server.status();
+            if !matches!(
+                status,
+                ide_core::event::ServerStatus::Missing
+                    | ide_core::event::ServerStatus::Misconfigured
+                    | ide_core::event::ServerStatus::Crashed
+            ) && tokio::time::Instant::now() < deadline
+                && let Ok(_restart) =
+                    cancellable_wait(cancel, tokio::time::timeout_at(deadline, self.reconfigure_lock.lock())).await?
+            {
+                // A restart publishes Down while reaping its old JVM. Its successor may
+                // also have a new identity after changing the shared workspace.
+                if let Some(current) = self.servers_for(&java, path).into_iter().find(|s| s.name == SERVER)
+                    && current.root.is_dir()
+                    && (current.id != server.id || current.is_starting() || current.running().is_some())
+                {
+                    continue;
+                }
+            }
+            let status = server.status();
+            return Err(IdeError::unavailable(match status {
+                ide_core::event::ServerStatus::Missing => {
+                    "jdtls is not installed (Settings › Languages & Frameworks › Language Servers)".to_owned()
+                }
+                ide_core::event::ServerStatus::Misconfigured | ide_core::event::ServerStatus::Crashed => {
+                    server.status_message().unwrap_or_else(|| "jdtls cannot start".to_owned())
+                }
+                _ => format!("jdtls is not ready ({status:?})"),
+            }));
         }
     }
 
@@ -788,10 +827,11 @@ impl LspManager {
 
     /// Incremental build of the jdtls workspace (`java/buildWorkspace`), so
     /// class files are up to date before a launch.
-    pub async fn java_build(&self, path: &Path, cancel: &CancellationToken) -> IdeResult<JavaBuildStatus> {
+    /// `full` asks jdtls for a clean build (`java/buildWorkspace(true)`, IDEA's Rebuild).
+    pub async fn java_build(&self, path: &Path, full: bool, cancel: &CancellationToken) -> IdeResult<JavaBuildStatus> {
         let (server, _) = self.jdtls(path, cancel).await?;
         let _lock = cancellable_wait(cancel, server.java_build_lock.lock()).await?;
-        let mut v = self.jdtls_request(path, "java/buildWorkspace", json!(false), BUILD_TIMEOUT, cancel).await?;
+        let mut v = self.jdtls_request(path, "java/buildWorkspace", json!(full), BUILD_TIMEOUT, cancel).await?;
         // The first build can finish the Maven import before ServiceReady is handled.
         let (server, run) = self.jdtls(path, cancel).await?;
         let changed = cancellable_wait(cancel, self.java_configure_compiler(&server, &run)).await??;
@@ -799,7 +839,7 @@ impl LspManager {
         let recheck = v.as_i64() == Some(2)
             && compiler_defaults(&server.effective_config()).as_object().is_some_and(|o| !o.is_empty());
         if changed || recheck {
-            v = self.jdtls_request(path, "java/buildWorkspace", json!(false), BUILD_TIMEOUT, cancel).await?;
+            v = self.jdtls_request(path, "java/buildWorkspace", json!(full), BUILD_TIMEOUT, cancel).await?;
         }
         Ok(JavaBuildStatus::from_code(v.as_i64().unwrap_or(0)))
     }
@@ -842,10 +882,11 @@ impl LspManager {
         module: &Path,
         test: bool,
         build: bool,
+        full_build: bool,
         build_lock_held: bool,
         cancel: &CancellationToken,
     ) -> IdeResult<JavaLaunchInfo> {
-        let build = if build { Some(self.java_build(module, cancel).await?) } else { None };
+        let build = if build { Some(self.java_build(module, full_build, cancel).await?) } else { None };
         if build == Some(JavaBuildStatus::Cancelled) {
             return Err(IdeError::cancelled());
         }
@@ -875,8 +916,45 @@ impl LspManager {
             };
             (cp, java_home)
         };
-        let (errors, error_count, scoped) = match build {
-            Some(JavaBuildStatus::WithErrors | JavaBuildStatus::Failed) => {
+        // An output folder deleted outside the IDE (`mvn clean` in a terminal) leaves JDT's
+        // incremental state current: the build compiles nothing and the launch fails with
+        // NoClassDefFoundError. Rebuild fully, once per folder that stays missing.
+        let missing = match (build, &cp) {
+            (Some(_), Some(found)) if !full_build && !build_lock_held => {
+                let (server, _) = self.jdtls(module, cancel).await?;
+                let absent = server.java_absent_outputs.lock();
+                missing_outputs(found, &self.project_root).into_iter().filter(|p| !absent.contains(p)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let (build, cp) = if missing.is_empty() {
+            (build, cp)
+        } else {
+            tracing::info!(?missing, "Java output folders are missing; rebuilding the workspace");
+            let rebuilt = self.java_build(module, true, cancel).await?;
+            if rebuilt == JavaBuildStatus::Cancelled {
+                return Err(IdeError::cancelled());
+            }
+            let (server, _) = self.jdtls(module, cancel).await?;
+            let fresh = {
+                let _lock = cancellable_wait(cancel, server.java_build_lock.lock()).await?;
+                self.java_classpath(module, test, cancel).await
+            };
+            let cp = match fresh {
+                Ok(fresh) => Some(fresh),
+                Err(e) if e.kind == ErrorKind::Cancelled => return Err(e),
+                Err(e) => {
+                    tracing::debug!("java.project.getClasspaths after rebuild: {e}");
+                    cp
+                }
+            };
+            if let Some(cp) = &cp {
+                server.java_absent_outputs.lock().extend(missing_outputs(cp, &self.project_root));
+            }
+            (Some(rebuilt), cp)
+        };
+        let (errors, error_count, scoped) = match (build, build_lock_held) {
+            (Some(JavaBuildStatus::WithErrors | JavaBuildStatus::Failed), _) | (None, true) => {
                 let scope_module = module.to_path_buf();
                 let cp = cp.clone();
                 let scope = tokio::task::spawn_blocking(move || LaunchScope::new(&scope_module, test, cp.as_ref()))
@@ -888,7 +966,9 @@ impl LspManager {
             }
             _ => (Vec::new(), 0, false),
         };
-        let build = if build == Some(JavaBuildStatus::WithErrors) && error_count == 0 && scoped {
+        let build = if build.is_none() && build_lock_held && error_count > 0 {
+            Some(JavaBuildStatus::WithErrors)
+        } else if build == Some(JavaBuildStatus::WithErrors) && error_count == 0 && scoped {
             Some(JavaBuildStatus::Succeeded)
         } else {
             build
@@ -1002,6 +1082,29 @@ impl LspManager {
     }
 }
 
+/// m2e's error on a `pom.xml` whose build plan can't be computed: a build plugin (or one of its
+/// dependencies) doesn't resolve, e.g. a version a company mirror lacks. The module is then left
+/// without its Java configuration and navigation finds nothing, with only this marker to tell.
+pub(crate) fn build_plan_failure(path: &Path, root: &Path, diagnostics: &[lsp_types::Diagnostic]) -> Option<String> {
+    if path.file_name()? != "pom.xml" {
+        return None;
+    }
+    let message = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
+        .find_map(|d| d.message.split_once("Could not calculate build plan:").map(|(_, m)| m))?;
+    const UNRESOLVED: &str = "could not be resolved";
+    let reason = match message.find(UNRESOLVED) {
+        Some(end) => &message[..end + UNRESOLVED.len()],
+        None => message.lines().next().unwrap_or(message),
+    };
+    Some(format!(
+        "{}: {}. Java navigation and completion don't work in this module until Maven resolves it: make it available in your Maven repository or mirror, or set a version the repository has in pom.xml.",
+        path.strip_prefix(root).unwrap_or(path).display(),
+        reason.trim().trim_end_matches(':')
+    ))
+}
+
 impl LspManager {
     /// JDT LS aborted its import with `message`: when reserved Windows device names
     /// below `root` are the cause, say which (once). The walk runs off the RPC thread.
@@ -1028,6 +1131,29 @@ mod tests {
         let language: ide_language::LanguageConfig =
             toml::from_str(include_str!("../../../languages/java.toml")).unwrap();
         language.language_servers.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn an_unresolvable_build_plugin_is_explained() {
+        let diagnostic = |severity, message: &str| lsp_types::Diagnostic {
+            severity: Some(severity),
+            message: message.into(),
+            ..Default::default()
+        };
+        let error = diagnostic(
+            lsp_types::DiagnosticSeverity::ERROR,
+            "CoreException: Could not calculate build plan: Plugin org.apache.maven.plugins:maven-compiler-plugin:3.13.0 or one of its dependencies could not be resolved: Failure to find org.apache.maven.plugins:maven-compiler-plugin:jar:3.13.0 in https://nexus.corp/repository/public",
+        );
+        let info = diagnostic(
+            lsp_types::DiagnosticSeverity::INFORMATION,
+            "Plugin execution not covered by lifecycle configuration",
+        );
+        let (root, pom) = (Path::new("/w"), Path::new("/w/app/pom.xml"));
+        let body = build_plan_failure(pom, root, &[info.clone(), error.clone()]).unwrap();
+        assert!(body.starts_with("app/pom.xml: Plugin org.apache.maven.plugins:maven-compiler-plugin:3.13.0 or one of its dependencies could not be resolved. Java navigation"), "{body}");
+        assert!(!body.contains("nexus.corp"));
+        assert_eq!(build_plan_failure(pom, root, &[info]), None);
+        assert_eq!(build_plan_failure(Path::new("/w/app/src/Main.java"), root, &[error]), None);
     }
 
     #[test]
@@ -1295,6 +1421,22 @@ mod tests {
         assert_eq!(parse_classpaths(&Value::Null), JavaClasspath::default());
         let java_style = parse_classpaths(&json!({ "projectRoot": "file:/p/my%20demo" }));
         assert_eq!(java_style.project_root, Some("/p/my demo".into()));
+    }
+
+    #[test]
+    fn missing_outputs_are_project_folders_that_no_longer_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("demo");
+        let kept = root.join("app/target/classes");
+        std::fs::create_dir_all(&kept).unwrap();
+        let deleted = root.join("core/target/classes");
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let cp = JavaClasspath {
+            project_root: None,
+            class_paths: vec![s(&kept), s(&deleted), s(&root.join("lib/absent.jar")), s(&dir.path().join("elsewhere"))],
+            module_paths: vec![s(&root.join("api/target/classes"))],
+        };
+        assert_eq!(missing_outputs(&cp, &root), [deleted, root.join("api/target/classes")]);
     }
 
     #[test]

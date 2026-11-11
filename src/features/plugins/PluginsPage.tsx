@@ -11,6 +11,7 @@ import clsx from "clsx";
 import type {
   CapabilityInfo,
   CatalogPlugin,
+  DependencyState,
   MarketPlugin,
   PluginIcon as PluginIconData,
   PluginInfo,
@@ -31,7 +32,7 @@ import {
   type MenuItem,
   T,
 } from "@/ui";
-import { RISK_LABEL, sortByRisk } from "./consent";
+import { RISK_LABEL, sortByRisk, capabilityDescription } from "./consent";
 import { pluginIconName } from "./pluginIcon";
 import { localizeContributions, usePluginCatalogs, usePluginT } from "./pluginText";
 import { itemsOf, uiPoint } from "./projection";
@@ -49,15 +50,19 @@ import {
   reloadPlugin,
   setAllInstalledEnabled,
   setPluginCapability,
+  revokePluginNetHost,
   setPluginEnabled,
   uninstallPlugin,
   updateAllPlugins,
   usePlugins,
 } from "./store";
 import { useProject } from "@/platform/project";
+import { openExternalUrl } from "@/platform/openUrl";
 import { importIntellijTheme, showInstalledIntellijThemes } from "./intellijImport";
 import { promptInput } from "@/workbench/inputDialogs";
 import styles from "./PluginsPage.module.css";
+import { pluginsBackend } from "./backend";
+import { confirm } from "@/workbench/messages";
 import { tx } from "@/platform/i18n";
 
 const STATUS: Record<PluginStatus, { label: string; tone: "success" | "accent" | "neutral" | "danger" | "warning" }> = {
@@ -67,6 +72,15 @@ const STATUS: Record<PluginStatus, { label: string; tone: "success" | "accent" |
   disabled: { label: "Disabled", tone: "neutral" },
   needsConsent: { label: "Needs permission", tone: "warning" },
   failed: { label: "Failed", tone: "danger" },
+  blocked: { label: "Blocked", tone: "warning" },
+};
+
+const DEPENDENCY_STATE: Record<DependencyState, { label: string; tone: "success" | "neutral" | "warning" }> = {
+  satisfied: { label: "Installed", tone: "success" },
+  missing: { label: "Not installed", tone: "warning" },
+  disabled: { label: "Disabled", tone: "neutral" },
+  version: { label: "Wrong version", tone: "warning" },
+  blocked: { label: "Cannot run", tone: "warning" },
 };
 
 /** Human names of the built-in contribution points (others show their id). */
@@ -115,6 +129,15 @@ export function catalogState(
 
 const vendorOf = (authors: readonly string[]) => authors.join(", ");
 
+/** The marketplace's newer version of an installed plugin, if there is one this IDE can load. */
+function useMarketUpdate(plugin: PluginInfo): MarketPlugin | undefined {
+  return usePlugins((s) =>
+    plugin.source === "installed"
+      ? s.market?.find((m) => m.id === plugin.id && m.compatible && compareVersions(m.version, plugin.version) > 0)
+      : undefined,
+  );
+}
+
 function PluginIcon({ id, icon, large }: { id: string; icon: PluginIconData | null | undefined; large?: boolean }) {
   return (
     <span className={clsx(styles.icon, large && styles.iconLarge)} aria-hidden>
@@ -134,6 +157,7 @@ function ListHeader({ title, count }: { title: string; count: number }) {
 
 function InstalledRow({ plugin, selected, onSelect }: { plugin: PluginInfo; selected: boolean; onSelect: () => void }) {
   const busy = usePlugins((s) => !!s.busy[plugin.id]);
+  const update = useMarketUpdate(plugin);
   return (
     <li className={clsx(styles.row, selected && styles.rowSelected, !plugin.enabled && styles.rowDisabled)}>
       <button
@@ -152,6 +176,7 @@ function InstalledRow({ plugin, selected, onSelect }: { plugin: PluginInfo; sele
             {plugin.source !== "installed" && (
               <span className={styles.devTag}>{plugin.source === "linked" ? tx("linked") : tx("dev")}</span>
             )}
+            {update && <Badge tone="accent">{tx("Update")}</Badge>}
             {plugin.status === "failed" && (
               <Badge dot tone="danger">
                 <T>Failed</T>
@@ -234,6 +259,80 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
+/** What a plugin needs, who needs it and the extension points it offers; nothing when it has none. */
+function Relations({ plugin }: { plugin: PluginInfo }) {
+  return (
+    <>
+      {plugin.depends.length > 0 && (
+        <Section title="Requires">
+          <ul className={styles.items} aria-label={tx("Required plugins")}>
+            {plugin.depends.map((dep) => (
+              <li key={dep.id} className={styles.item}>
+                <span className={styles.itemMain}>
+                  {dep.name ?? dep.id}
+                  {dep.version ? ` ${dep.version}` : ""}
+                  {dep.optional ? ` ${tx("(optional)")}` : ""}
+                </span>
+                <Badge tone={DEPENDENCY_STATE[dep.state].tone}>{DEPENDENCY_STATE[dep.state].label}</Badge>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+      {plugin.dependents.length > 0 && (
+        <Section title="Required by">
+          <ul className={styles.items} aria-label={tx("Plugins that require this one")}>
+            {plugin.dependents.map((dependent) => (
+              <li key={dependent.id} className={styles.item}>
+                <span className={styles.itemMain}>{dependent.name}</span>
+                {!dependent.enabled && <Badge tone="neutral">{tx("Disabled")}</Badge>}
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+      {plugin.extensionPoints.length > 0 && (
+        <Section title="Extension points">
+          <ul className={styles.items} aria-label={tx("Extension points this plugin offers")}>
+            {plugin.extensionPoints.map((point) => (
+              <li key={point.id} className={styles.item}>
+                <span className={styles.itemMain} title={point.description || point.id}>
+                  <span className={styles.mono}>{point.id}</span>
+                </span>
+                <span className={styles.muted}>
+                  {point.contributors.length > 0
+                    ? tx`Contributed by ${point.contributors.join(", ")}`
+                    : tx("No contributions")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+    </>
+  );
+}
+
+/** Asks before disabling a plugin that enabled plugins need: they stop with it. */
+async function toggleEnabled(plugin: PluginInfo): Promise<void> {
+  const needing = plugin.dependents.filter((d) => d.enabled).map((d) => d.name);
+  if (plugin.enabled && plugin.status !== "failed" && needing.length > 0) {
+    const names = needing.join(", ");
+    const confirmed = await confirm({
+      title: tx("Disable plugin"),
+      message:
+        needing.length === 1
+          ? tx`${names} needs ${plugin.name} and stops while it is disabled. Disable it anyway?`
+          : tx`${names} need ${plugin.name} and stop while it is disabled. Disable it anyway?`,
+      ok: tx("Disable"),
+      icon: "warning",
+    });
+    if (!confirmed) return;
+  }
+  // Enabling an enabled plugin stops and starts it again: that is "Restart".
+  await setPluginEnabled(plugin.id, !plugin.enabled || plugin.status === "failed");
+}
+
 function DetailTabs({ notes, overview }: { notes: string | null; overview: ReactNode }) {
   const [tab, setTab] = useState<"overview" | "whatsNew">("overview");
   return (
@@ -292,19 +391,88 @@ function PointSection({ plugin, point }: { plugin: PluginInfo; point: string }) 
   );
 }
 
-function CapabilityRow({ cap, children }: { cap: CapabilityInfo; children?: ReactNode }) {
+function CapabilityRow({ cap, children, program }: { cap: CapabilityInfo; children?: ReactNode; program?: ReactNode }) {
   return (
-    <li className={styles.item}>
-      {children}
-      <span className={styles.itemMain}>{tx(cap.description)}</span>
-      <span className={styles.mono}>{cap.id}</span>
-      <Badge tone={RISK_LABEL[cap.risk].tone}>{RISK_LABEL[cap.risk].label}</Badge>
+    <li className={styles.capabilityItem}>
+      <div className={styles.capabilityHeader}>
+        {children}
+        <span className={styles.mono}>{cap.id}</span>
+        <Badge tone={RISK_LABEL[cap.risk].tone}>{RISK_LABEL[cap.risk].label}</Badge>
+      </div>
+      <p className={styles.capabilityDescription}>{capabilityDescription(cap)}</p>
+      {program}
     </li>
   );
 }
 
+function ProgramPermission({ plugin, cap, disabled }: { plugin: PluginInfo; cap: CapabilityInfo; disabled: boolean }) {
+  const project = useProject((s) => s.project);
+  const [scope, setScope] = useState<"global" | "project">("global");
+  const [path, setPath] = useState("");
+  const [error, setError] = useState("");
+  const [working, setWorking] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void pluginsBackend()
+      .program(plugin.id, cap.id.slice(8), scope)
+      .then((p) => {
+        if (live) setPath(p);
+      })
+      .catch(() => {
+        if (live) setPath("");
+      });
+    return () => {
+      live = false;
+    };
+  }, [plugin, cap.id, scope, working]);
+  const choose = async (reset: boolean) => {
+    setError("");
+    setWorking(true);
+    try {
+      const selected = reset ? null : await pluginsBackend().pickProgram();
+      if (!reset && !selected) return;
+      const message = reset
+        ? tx("Revalidate the default executable? If it is unavailable, this permission will be revoked.")
+        : tx`Allow ${plugin.name} to run ${selected}? This is equivalent to running arbitrary code on this machine.`;
+      if (!(await confirm({ title: tx("Approve plugin executable"), message, ok: tx("Allow"), icon: "warning" })))
+        return;
+      await pluginsBackend().chooseProgram(plugin.id, cap.id, scope, selected);
+      await refreshPlugins();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWorking(false);
+    }
+  };
+  return (
+    <div className={styles.programPermission}>
+      {path && <span className={clsx(styles.mono, styles.programPath)}>{path}</span>}
+      <Select
+        aria-label={tx("Executable scope")}
+        value={scope}
+        onChange={(value) => setScope(value as "global" | "project")}
+        options={[
+          { value: "global", label: tx("Global") },
+          ...(project ? [{ value: "project", label: tx("Project") }] : []),
+        ]}
+      />
+      <Button disabled={disabled || working} onClick={() => void choose(false)}>
+        {tx("Choose executable…")}
+      </Button>
+      <Button disabled={disabled || working} onClick={() => void choose(true)}>
+        {tx("Reset executable")}
+      </Button>
+      {error && (
+        <span role="alert" className={styles.error}>
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function CapabilityList({ plugin, busy }: { plugin: PluginInfo; busy: boolean }) {
-  if (plugin.capabilities.length === 0) {
+  if (plugin.capabilities.length === 0 && plugin.netHosts.length === 0) {
     return (
       <div className={styles.muted}>
         <T>No special permissions.</T>
@@ -315,7 +483,13 @@ function CapabilityList({ plugin, busy }: { plugin: PluginInfo; busy: boolean })
   return (
     <ul className={styles.items} aria-label={tx("Permissions")}>
       {sortByRisk(plugin.capabilities).map((c) => (
-        <CapabilityRow key={c.id} cap={c}>
+        <CapabilityRow
+          key={c.id}
+          cap={c}
+          program={
+            c.id.startsWith("process:") && <ProgramPermission plugin={plugin} cap={c} disabled={busy || !confirmed} />
+          }
+        >
           <Checkbox
             checked={c.granted}
             disabled={busy || !confirmed}
@@ -324,12 +498,65 @@ function CapabilityList({ plugin, busy }: { plugin: PluginInfo; busy: boolean })
           />
         </CapabilityRow>
       ))}
+      {plugin.netHosts.map((host) => (
+        <NetHostRow key={host} plugin={plugin} host={host} disabled={busy || !confirmed} />
+      ))}
     </ul>
+  );
+}
+
+/** A host the user allowed through `net:ask` ("always"); removing it asks again next time. */
+function NetHostRow({ plugin, host, disabled }: { plugin: PluginInfo; host: string; disabled: boolean }) {
+  return (
+    <li className={styles.capabilityItem}>
+      <div className={styles.capabilityHeader}>
+        <span className={styles.mono}>{`net:${host}`}</span>
+        <Badge tone={RISK_LABEL.medium.tone}>{RISK_LABEL.medium.label}</Badge>
+      </div>
+      <p className={styles.capabilityDescription}>
+        {tx("Allowed when the plugin asked at first use. Remove it to be asked again.")}
+      </p>
+      <div className={styles.programPermission}>
+        <Button disabled={disabled} onClick={() => void revokePluginNetHost(plugin.id, host)}>
+          {tx("Remove")}
+        </Button>
+      </div>
+    </li>
+  );
+}
+
+function Homepage({ value }: { value: string }) {
+  let isWebUrl = false;
+  try {
+    const { protocol } = new URL(value);
+    isWebUrl = protocol === "http:" || protocol === "https:";
+  } catch {
+    // Malformed manifest values remain readable as plain text.
+  }
+  return (
+    <dd className={clsx(styles.mono, styles.homepage)}>
+      {isWebUrl ? (
+        <a
+          href={value}
+          className={styles.homepageLink}
+          onClick={(event) => {
+            event.preventDefault();
+            void openExternalUrl(value);
+          }}
+        >
+          {value}
+        </a>
+      ) : (
+        value
+      )}
+    </dd>
   );
 }
 
 function InstalledDetails({ plugin }: { plugin: PluginInfo }) {
   const busy = usePlugins((s) => !!s.busy[plugin.id]);
+  const installing = usePlugins((s) => s.installing);
+  const update = useMarketUpdate(plugin);
   const status = STATUS[plugin.status];
   const [confirmUninstall, setConfirmUninstall] = useState(false);
 
@@ -362,7 +589,7 @@ function InstalledDetails({ plugin }: { plugin: PluginInfo }) {
             <dt>
               <T>Homepage</T>
             </dt>
-            <dd className={styles.mono}>{plugin.homepage}</dd>
+            <Homepage value={plugin.homepage} />
           </>
         )}
       </dl>
@@ -385,6 +612,8 @@ function InstalledDetails({ plugin }: { plugin: PluginInfo }) {
           {w}
         </div>
       ))}
+
+      <Relations plugin={plugin} />
 
       <Section title="Permissions">
         <CapabilityList plugin={plugin} busy={busy} />
@@ -430,12 +659,21 @@ function InstalledDetails({ plugin }: { plugin: PluginInfo }) {
         </div>
         <div className={styles.headerActions}>
           {busy && <Spinner size={14} label="Working" />}
+          {update && (
+            <Button
+              size="small"
+              variant="primary"
+              disabled={busy || installing}
+              onClick={() => void installFromMarket(update.id)}
+            >
+              {tx`Update to ${update.version}`}
+            </Button>
+          )}
           <Button
             size="small"
             variant={plugin.enabled ? "secondary" : "primary"}
             disabled={busy}
-            // Enabling an enabled plugin stops and starts it again: that is "Restart".
-            onClick={() => void setPluginEnabled(plugin.id, !plugin.enabled || plugin.status === "failed")}
+            onClick={() => void toggleEnabled(plugin)}
           >
             {plugin.enabled ? (plugin.status === "failed" ? "Restart" : "Disable") : "Enable"}
           </Button>
@@ -503,6 +741,14 @@ function CatalogDetails({ entry }: { entry: CatalogPlugin }) {
           <T>Code</T>
         </dt>
         <dd>{entry.hasCode ? tx("WebAssembly component (sandboxed)") : tx("None — contributions only")}</dd>
+        {entry.homepage && (
+          <>
+            <dt>
+              <T>Homepage</T>
+            </dt>
+            <Homepage value={entry.homepage} />
+          </>
+        )}
         {contributes.length > 0 && (
           <>
             <dt>

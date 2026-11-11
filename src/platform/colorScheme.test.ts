@@ -29,6 +29,12 @@ describe("color schemes", () => {
     expect(dark.get("--syn-python-bytes")).toBe("#a5c261");
   });
 
+  it.each(["light", "dark"] as const)("inherits new doc tokens for older %s custom schemes", (parent) => {
+    const customs = { "custom-old": { name: "Old", parent, attributes: {} } };
+    for (const id of ["docCommentTag", "docCommentTagValue", "docCommentMarkup"])
+      expect(resolvedAttribute("custom-old", id, customs)).toEqual(resolvedAttribute(parent, id));
+  });
+
   it("gives PHP variables and function calls their own colours, as PhpStorm (#1532)", () => {
     expect(schemeTokens("dark").get("--syn-php-variable")).toBe("#c77dbb");
     expect(schemeTokens("dark").get("--syn-php-function-call")).toBe("#56a8f5");
@@ -108,6 +114,30 @@ describe("color schemes", () => {
     expect(upright).toContain("--syn-static-italic: normal !important");
     const pythonItalic = schemeCss("theme-default", { light: { pyStaticSymbol: { italic: true } } }, root);
     expect(pythonItalic).toContain("--syn-python-static-italic: italic !important");
+  });
+
+  it("leaves selected text in syntax colours until a selection foreground is set (#2446)", () => {
+    expect(ATTRIBUTES.find((a) => a.id === "selectionForeground")).toMatchObject({
+      name: "Selection foreground",
+      path: ["General", "Editor"],
+      fg: "--fg-editor-selection",
+    });
+    // The `inherit` default is not a colour: the settings page shows no foreground.
+    expect(resolvedAttribute("light", "selectionForeground")).toEqual({});
+    expect(resolvedAttribute("dark", "selectionForeground")).toEqual({});
+    const customs = {
+      "custom-sel": {
+        name: "Sel",
+        parent: "dark" as const,
+        attributes: { selectionForeground: { foreground: "#112233" } },
+      },
+    };
+    expect(resolvedAttribute("custom-sel", "selectionForeground", customs)).toMatchObject({
+      foreground: "#112233",
+    });
+    expect(schemeCss("dark", { dark: { selectionForeground: { foreground: "#112233" } } })).toContain(
+      "--fg-editor-selection: #112233 !important",
+    );
   });
 
   it("applies an explicit scheme over a plugin theme of the same base", () => {

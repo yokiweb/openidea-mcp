@@ -59,16 +59,16 @@ pub struct Settings {
     /// Build, Execution, Deployment › Run Targets.
     pub run_targets: Vec<RunTarget>,
     pub cmake: CMakeSettings,
-    /// Tools › Agents › Chat.
+    /// Settings › Agents.
     pub agents: AgentSettings,
-    /// Tools › MCP Server (global only).
+    /// Agents › MCP Server (global only).
     pub mcp_server: McpServerSettings,
     /// Plugin settings (`[contributes.settings]`): plugin id → its values by key.
     #[specta(type = BTreeMap<String, BTreeMap<String, specta_typescript::Unknown>>)]
     pub plugins: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
-/// What the meters in an agent task's header show.
+/// Settings › Agents: what the conversation shows and how messages are sent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AgentSettings {
@@ -80,15 +80,182 @@ pub struct AgentSettings {
     pub show_usage_limits: bool,
     /// What the session has cost so far, as the agent reports it.
     pub show_cost: bool,
+    /// A finished turn's work folds into one line under its message, leaving the reply.
+    pub fold_turns: bool,
+    /// Streaming text is revealed at a steady pace rather than chunk by chunk.
+    pub smooth_text: bool,
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = ThinkingDisplay)]
+    pub thinking: ThinkingDisplay,
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = ToolCallDisplay)]
+    pub tool_calls: ToolCallDisplay,
+    /// A tool call's output (a command's, a diff) is shown without opening it.
+    pub expand_tool_output: bool,
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = SendKey)]
+    pub send_with: SendKey,
+    /// What sending does while the agent works: queue the message for after the turn, or
+    /// send it into the turn.
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = WhileRunning)]
+    pub while_running: WhileRunning,
+    /// Settings new tasks of an agent start with: agent id → option id → value.
+    #[serde(deserialize_with = "agent_defaults")]
+    #[specta(type = BTreeMap<String, BTreeMap<String, String>>)]
+    pub defaults: BTreeMap<String, BTreeMap<String, String>>,
+    /// MCP servers passed to coding agents in `session/new`, `session/load` and `session/fork`,
+    /// keyed by server name (`[agents.mcpServers.<name>]`).
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = BTreeMap<String, AgentMcpServer>)]
+    pub mcp_servers: BTreeMap<String, AgentMcpServer>,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
-        Self { show_context_usage: true, show_work_time: true, show_usage_limits: true, show_cost: false }
+        Self {
+            show_context_usage: true,
+            show_work_time: true,
+            show_usage_limits: true,
+            show_cost: false,
+            fold_turns: true,
+            smooth_text: true,
+            thinking: ThinkingDisplay::Auto,
+            tool_calls: ToolCallDisplay::Grouped,
+            expand_tool_output: false,
+            send_with: SendKey::Enter,
+            while_running: WhileRunning::Queue,
+            defaults: BTreeMap::new(),
+            mcp_servers: BTreeMap::new(),
+        }
     }
 }
 
-/// Tools › MCP Server: agents use the IDE's built-in tools.
+/// Transport of an MCP server configured in Settings › Agents › MCP Servers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+    Sse,
+}
+
+/// An MCP server passed to coding agents in `session/new`, `session/load` and `session/fork`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentMcpServer {
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = McpTransport)]
+    pub transport: McpTransport,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Agent provider ids this server is enabled for (e.g. `["claude", "codex"]`);
+    /// empty means enabled for all agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+}
+
+impl Default for AgentMcpServer {
+    fn default() -> Self {
+        Self {
+            transport: McpTransport::Stdio,
+            enabled: true,
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            agents: Vec::new(),
+        }
+    }
+}
+
+/// A hand-edited value these settings don't know reads as the default, rather than
+/// failing the whole settings file.
+fn or_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).unwrap_or_default())
+}
+
+/// [`AgentSettings::defaults`], keeping only the text values of each agent's table.
+fn agent_defaults<'de, D>(d: D) -> Result<BTreeMap<String, BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let serde_json::Value::Object(agents) = serde_json::Value::deserialize(d)? else { return Ok(BTreeMap::new()) };
+    Ok(agents
+        .into_iter()
+        .filter_map(|(agent, options)| match options {
+            serde_json::Value::Object(options) => Some((
+                agent,
+                options
+                    .into_iter()
+                    .filter_map(|(k, v)| match v {
+                        serde_json::Value::String(v) => Some((k, v)),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
+            _ => None,
+        })
+        .collect())
+}
+
+/// How the agent's reasoning shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ThinkingDisplay {
+    /// Open while it streams, folded once it ends.
+    #[default]
+    Auto,
+    Expanded,
+    Collapsed,
+}
+
+/// How tool calls between messages show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolCallDisplay {
+    /// A run of calls is one line saying what they did ("Read 4 files · Edited 2 files").
+    #[default]
+    Grouped,
+    /// Each call on its own line.
+    Each,
+}
+
+/// The key that sends a message; the other one starts a new line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SendKey {
+    #[default]
+    Enter,
+    ModEnter,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum WhileRunning {
+    #[default]
+    Queue,
+    Steer,
+}
+
+/// Agents › MCP Server: agents use the IDE's built-in tools.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct McpServerSettings {
@@ -266,6 +433,10 @@ pub struct CustomKeymap {
 pub struct GeneralSettings {
     pub reopen_last_project: bool,
     pub confirm_exit: bool,
+    /// When on, the last window closes instead of showing the Welcome screen.
+    pub close_without_welcome: bool,
+    /// When on, closing a window drops its saved editor tabs, so they are not restored next time.
+    pub close_tabs_with_window: bool,
     /// Where Open… puts a project while one is open: `ask` | `new` | `same` | `attach`.
     pub open_project_in: String,
     /// Initial folder of the Open / Clone dialogs; empty = the OS default.
@@ -281,6 +452,7 @@ pub struct GeneralSettings {
     pub project_name: String,
     /// Where updates come from: `auto` (the CNB mirror for the Chinese UI, else GitHub) | `github` | `cnb`.
     pub update_source: String,
+    pub auto_check_updates: bool,
 }
 
 impl Default for GeneralSettings {
@@ -288,6 +460,8 @@ impl Default for GeneralSettings {
         Self {
             reopen_last_project: true,
             confirm_exit: true,
+            close_without_welcome: false,
+            close_tabs_with_window: false,
             open_project_in: "ask".into(),
             default_project_directory: String::new(),
             save_on_idle: false,
@@ -296,6 +470,7 @@ impl Default for GeneralSettings {
             power_save_mode: false,
             project_name: String::new(),
             update_source: "auto".into(),
+            auto_check_updates: true,
         }
     }
 }
@@ -350,6 +525,21 @@ impl Default for NotificationGroupSettings {
     }
 }
 
+/// Where the Navigation Bar (the file path breadcrumbs) is shown. Mirrors
+/// IDEA's `View | Appearance | Navigation Bar` (Top / Status Bar / Don't show).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum NavigationBarPosition {
+    /// Above the editor, below the main menu / toolbar.
+    Top,
+    /// In the footer, next to the status bar widgets — the default, matching
+    /// where the bar lived before the three-state choice existed.
+    #[default]
+    StatusBar,
+    /// Not shown at all.
+    Hidden,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppearanceSettings {
@@ -386,6 +576,8 @@ pub struct AppearanceSettings {
     pub menu_icons: bool,
     /// `hamburger` | `merged`: main menu presentation in the frameless title bar.
     pub main_menu_style: String,
+    /// A lone Alt press focuses or opens the main menu (IDEA `ide.windows.main.menu.focus.on.alt`).
+    pub main_menu_alt: bool,
     /// `subpixel` | `greyscale` | `none`
     pub ide_antialiasing: String,
     pub editor_antialiasing: String,
@@ -393,6 +585,12 @@ pub struct AppearanceSettings {
     pub show_tool_window_names: bool,
     pub show_tool_window_badges: bool,
     pub widescreen_tool_windows: bool,
+    /// View › Appearance › Toolbar; hidden leaves IDEA's compact window header.
+    pub show_main_toolbar: bool,
+    pub show_status_bar: bool,
+    /// View › Appearance › Navigation Bar: the file path breadcrumbs, shown in
+    /// the status bar by default, above the editor, or not at all.
+    pub navigation_bar: NavigationBarPosition,
     /// Status bar widgets shown (`true`) or hidden (`false`) by the user
     /// (status bar context menu); widgets not listed use their default.
     pub status_bar_widgets: BTreeMap<String, bool>,
@@ -456,12 +654,16 @@ impl Default for AppearanceSettings {
             dnd_with_alt_only: false,
             menu_icons: true,
             main_menu_style: "hamburger".into(),
+            main_menu_alt: true,
             ide_antialiasing: "greyscale".into(),
             editor_antialiasing: "greyscale".into(),
             show_tool_window_bars: true,
             show_tool_window_names: false,
             show_tool_window_badges: true,
             widescreen_tool_windows: false,
+            show_main_toolbar: true,
+            show_status_bar: true,
+            navigation_bar: NavigationBarPosition::StatusBar,
             status_bar_widgets: BTreeMap::new(),
             main_toolbar: None,
         }
@@ -499,6 +701,9 @@ pub struct EditorSettings {
     /// Color Scheme › Language Defaults › Semantic highlighting: local variables and
     /// parameters get a colour derived from their name (IDEA's rainbow identifiers).
     pub semantic_highlighting: bool,
+    /// Docstring markup format whose tags and keywords the Python editor highlights
+    /// (`plain`, `rest`, `epytext`, `google`, `numpy`).
+    pub docstring_format: String,
     /// Color Scheme › Language Defaults › Rainbow brackets: `()`, `[]`, `{}` coloured by depth.
     pub rainbow_brackets: bool,
     pub ligatures: bool,
@@ -543,6 +748,7 @@ impl Default for EditorSettings {
             color_overrides: BTreeMap::new(),
             custom_schemes: BTreeMap::new(),
             semantic_highlighting: false,
+            docstring_format: "rest".into(),
             rainbow_brackets: false,
             ligatures: false,
             fallback_font: String::new(),
@@ -587,6 +793,15 @@ pub struct FileSettings {
     pub file_types: BTreeMap<String, FileTypeAssociation>,
     /// Override File Type: file (project-relative and `/`-separated, or absolute) → language id.
     pub file_type_overrides: BTreeMap<String, String>,
+    /// Compose detection choices, keyed by project-relative file path.
+    pub compose_file_overrides: BTreeMap<String, ComposeFileOverride>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ComposeFileOverride {
+    Kept,
+    Excluded,
 }
 
 /// One language's file name and hashbang patterns on top of its definition.
@@ -614,6 +829,7 @@ impl Default for FileSettings {
             local_history_max_mb: 512,
             file_types: BTreeMap::new(),
             file_type_overrides: BTreeMap::new(),
+            compose_file_overrides: BTreeMap::new(),
         }
     }
 }
@@ -621,6 +837,8 @@ impl Default for FileSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LanguagesSettings {
+    /// Explicit plugin formatter, by language id. Empty entries use the normal formatter policy.
+    pub plugin_formatters: BTreeMap<String, String>,
     pub python: PythonSettings,
     pub node: NodeSettings,
     pub php: PhpSettings,
@@ -633,11 +851,13 @@ pub struct LanguagesSettings {
     pub java: JavaSettings,
     pub ruby: RubySettings,
     pub markdown: MarkdownSettings,
+    pub arduino: ArduinoSettings,
 }
 
 impl Default for LanguagesSettings {
     fn default() -> Self {
         Self {
+            plugin_formatters: BTreeMap::new(),
             python: PythonSettings::default(),
             node: NodeSettings::default(),
             php: PhpSettings::default(),
@@ -653,8 +873,20 @@ impl Default for LanguagesSettings {
             java: JavaSettings::default(),
             ruby: RubySettings::default(),
             markdown: MarkdownSettings::default(),
+            arduino: ArduinoSettings::default(),
         }
     }
+}
+
+/// Arduino tool discovery paths and default board FQBN, configured in `settings.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ArduinoSettings {
+    pub cli: String,
+    pub clangd: String,
+    pub language_server: String,
+    pub cli_config: String,
+    pub fqbn: String,
 }
 
 /// Languages & Frameworks › Markdown. Like IDEA's, it is application-level only.
@@ -759,6 +991,8 @@ impl Default for PythonSettings {
 pub struct PhpSettings {
     /// `php` CLI executable; empty = the one on `PATH`.
     pub interpreter: String,
+    /// Run PHP/Composer or Node/package-manager commands in this target; empty = project default, `local` = local.
+    pub run_target: String,
     /// PHP version the language server checks the code against (`7.4`); empty = from
     /// `composer.json` (`config.platform.php`, else the lowest version `require.php` allows).
     pub language_level: String,
@@ -786,6 +1020,8 @@ pub struct RubySettings {
 pub struct NodeSettings {
     /// `node` executable; empty = the one on `PATH`.
     pub interpreter: String,
+    /// Run PHP/Composer or Node/package-manager commands in this target; empty = project default, `local` = local.
+    pub run_target: String,
     /// `npm` | `pnpm` | `yarn`; empty = detect from the lock file / `packageManager`.
     pub package_manager: String,
 }
@@ -870,6 +1106,8 @@ pub struct JavaSettings {
     /// Extra JVM options for the Java language server (jdtls), space-separated
     /// (VS Code's `java.jdt.ls.vmargs`).
     pub jdtls_vm_args: String,
+    /// Share one JDT LS across builds in an ordinary project window; other windows remain separate.
+    pub jdtls_shared: bool,
     /// Build Tools › Maven.
     pub maven: MavenSettings,
     /// Build Tools › Gradle.
@@ -926,6 +1164,8 @@ pub struct MavenSettings {
     pub home: String,
     /// User `settings.xml` (`-s`); empty = `~/.m2/settings.xml`.
     pub user_settings: String,
+    /// Toolchains file (`-t`); empty = `~/.m2/toolchains.xml`.
+    pub toolchains: String,
     /// Local repository (`-Dmaven.repo.local`); empty = from `settings.xml`.
     pub local_repository: String,
     /// Run Maven through the Maven Daemon (`mvnd`) for faster builds. mvnd embeds
@@ -937,9 +1177,25 @@ pub struct MavenSettings {
     /// Thread count of Maven builds (`-T`): a number of threads (`4`) or a core
     /// multiplier (`2C`, `2.5C`); empty = Maven's default (one thread per module).
     pub threads: String,
+    /// Active Maven profiles (`-P`), comma-separated; empty leaves profiles to the POM/settings.
+    pub active_profiles: String,
 }
 
 impl MavenSettings {
+    /// Settings profiles followed by the Maven tool window's choices.
+    pub fn profiles(&self, choices: &[String]) -> Vec<String> {
+        let mut profiles = Vec::new();
+        for profile in self.active_profiles.split(',').chain(choices.iter().map(String::as_str)).map(str::trim) {
+            if !profile.is_empty() && !profiles.iter().any(|p| p == profile) {
+                profiles.push(profile.to_owned());
+            }
+        }
+        let excluded: Vec<String> =
+            profiles.iter().filter_map(|p| p.strip_prefix(['!', '-']).map(str::to_owned)).collect();
+        profiles.retain(|p| !excluded.contains(p));
+        profiles
+    }
+
     /// The `-T` value when it is one Maven accepts: a thread count (`4`) or a
     /// core multiplier with an optional decimal fraction (`1C`, `2.5C`).
     /// Anything else is dropped: a bad `-T` would make every Maven run fail.
@@ -1074,6 +1330,11 @@ pub struct ProjectStructureSettings {
     pub unmarked: Vec<String>,
     /// Content roots besides the project folder (absolute paths), shown and searched with it.
     pub content_roots: Vec<String>,
+    /// Other projects (absolute paths) this project depends on; indexed and navigable like content roots.
+    pub dependencies: Vec<String>,
+    /// Per-workspace-member dependencies: member root (IPC path) → the roots it depends on.
+    /// A member not listed here (or with an empty list) navigates only into itself.
+    pub member_dependencies: BTreeMap<String, Vec<String>>,
     /// "Exclude files": `;`-separated name patterns (`*.log;tmp*`) excluded at any depth.
     pub exclude_files: String,
     /// Project compiler output directory (relative to project root or absolute; empty = default).
@@ -1134,6 +1395,26 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_close_settings_default_off_and_round_trip() {
+        for old in [r#"{}"#, r#"{"general":{"confirmExit":false}}"#] {
+            let settings: Settings = serde_json::from_str(old).unwrap();
+            assert!(!settings.general.close_without_welcome);
+            assert!(!settings.general.close_tabs_with_window);
+        }
+        for close_window in [false, true] {
+            for close_tabs in [false, true] {
+                let mut settings = Settings::default();
+                settings.general.close_without_welcome = close_window;
+                settings.general.close_tabs_with_window = close_tabs;
+                let json = serde_json::to_value(&settings).unwrap();
+                assert_eq!(json["general"]["closeWithoutWelcome"], close_window);
+                assert_eq!(json["general"]["closeTabsWithWindow"], close_tabs);
+                assert_eq!(serde_json::from_value::<Settings>(json).unwrap().general, settings.general);
+            }
+        }
+    }
 
     #[test]
     fn cmake_profile_argument_arrays_round_trip() {
@@ -1198,6 +1479,21 @@ mod tests {
     }
 
     #[test]
+    fn docstring_format_defaults_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"editor":{"semanticHighlighting":true}}"#).unwrap();
+        assert_eq!(old.editor.docstring_format, "rest");
+        assert_eq!(Settings::default().editor.docstring_format, "rest");
+        for format in ["plain", "rest", "epytext", "google", "numpy"] {
+            let mut settings = Settings::default();
+            settings.editor.docstring_format = format.into();
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json["editor"]["docstringFormat"], format);
+            let restored: Settings = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.editor.docstring_format, format);
+        }
+    }
+
+    #[test]
     fn tool_window_badges_default_on_and_round_trip() {
         let old: Settings = serde_json::from_str(r#"{"appearance":{"showToolWindowNames":true}}"#).unwrap();
         assert!(old.appearance.show_tool_window_badges);
@@ -1210,6 +1506,27 @@ mod tests {
             let restored: Settings = serde_json::from_value(json).unwrap();
             assert_eq!(restored.appearance.show_tool_window_badges, enabled);
         }
+    }
+
+    #[test]
+    fn double_click_opens_diff_is_unset_by_default_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"vcs":{"commit":{"nonModal":true}}}"#).unwrap();
+        assert_eq!(old.vcs.commit.double_click_opens_diff, None);
+        // The unset value shows up as `null` in the defaults: `SettingsStore::set` only
+        // accepts a key path it finds there.
+        let json = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(json["vcs"]["commit"]["doubleClickOpensDiff"], serde_json::Value::Null);
+        for on in [true, false] {
+            let mut settings = Settings::default();
+            settings.vcs.commit.double_click_opens_diff = Some(on);
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json["vcs"]["commit"]["doubleClickOpensDiff"], on);
+            let restored: Settings = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.vcs.commit.double_click_opens_diff, Some(on));
+        }
+        // Explicit `null` reads back as unset.
+        let cleared: Settings = serde_json::from_str(r#"{"vcs":{"commit":{"doubleClickOpensDiff":null}}}"#).unwrap();
+        assert_eq!(cleared.vcs.commit.double_click_opens_diff, None);
     }
 
     #[test]
@@ -1227,12 +1544,32 @@ mod tests {
     }
 
     #[test]
+    fn hand_edited_agent_values_it_does_not_know_keep_the_rest() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"editor":{"fontSize":17},"agents":{"thinking":"open","sendWith":"modEnter",
+                "defaults":{"claude":{"model":"opus","effort":3},"codex":"x"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.editor.font_size, 17.0);
+        assert_eq!(settings.agents.thinking, ThinkingDisplay::Auto);
+        assert_eq!(settings.agents.send_with, SendKey::ModEnter);
+        assert_eq!(
+            settings.agents.defaults,
+            BTreeMap::from([("claude".into(), BTreeMap::from([("model".into(), "opus".into())]))])
+        );
+    }
+
+    #[test]
     fn main_menu_style_defaults_and_round_trips() {
         let old: Settings = serde_json::from_str(r#"{"appearance":{"compactMode":true}}"#).unwrap();
         assert_eq!(old.appearance.main_menu_style, "hamburger");
+        assert!(old.appearance.main_menu_alt);
         let merged: Settings = serde_json::from_str(r#"{"appearance":{"mainMenuStyle":"merged"}}"#).unwrap();
         assert_eq!(merged.appearance.main_menu_style, "merged");
         assert_eq!(serde_json::to_value(merged).unwrap()["appearance"]["mainMenuStyle"], "merged");
+        let off: Settings = serde_json::from_str(r#"{"appearance":{"mainMenuAlt":false}}"#).unwrap();
+        assert!(!off.appearance.main_menu_alt);
+        assert_eq!(serde_json::to_value(off).unwrap()["appearance"]["mainMenuAlt"], false);
     }
 
     #[test]
@@ -1400,6 +1737,24 @@ mod maven_linkage_tests {
     }
 
     #[test]
+    fn maven_profiles_combine_settings_and_tool_window_choices() {
+        let settings = MavenSettings { active_profiles: " a, b, ,a ".into(), ..Default::default() };
+        assert_eq!(settings.profiles(&["!b".into(), "c".into(), "a".into()]), ["a", "!b", "c"]);
+        let settings = MavenSettings { active_profiles: "!a".into(), ..Default::default() };
+        assert_eq!(settings.profiles(&["a".into()]), ["!a"]);
+    }
+
+    #[test]
+    fn maven_profiles_and_toolchains_round_trip_and_default_to_empty() {
+        let old: MavenSettings = serde_json::from_str(r#"{"home":"/opt/maven"}"#).unwrap();
+        assert!(old.toolchains.is_empty() && old.active_profiles.is_empty());
+        let settings =
+            MavenSettings { toolchains: "config files/toolchains.xml".into(), active_profiles: "a,b,!c".into(), ..old };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert_eq!(serde_json::from_str::<MavenSettings>(&encoded).unwrap(), settings);
+    }
+
+    #[test]
     fn thread_count_round_trips_and_defaults_to_empty() {
         // Old settings files predate the thread count; `serde(default)` keeps them loadable.
         let old: MavenSettings = serde_json::from_str(r#"{"home":"/opt/maven"}"#).unwrap();
@@ -1408,6 +1763,26 @@ mod maven_linkage_tests {
         let encoded = serde_json::to_string(&settings).unwrap();
         assert!(encoded.contains("\"threads\":\"2C\""));
         assert_eq!(serde_json::from_str::<MavenSettings>(&encoded).unwrap(), settings);
+    }
+}
+
+#[cfg(test)]
+mod java_settings_tests {
+    use super::*;
+
+    #[test]
+    fn shared_jdtls_defaults_off_and_round_trips() {
+        for old in [r#"{}"#, r#"{"jdk":"/jdk"}"#] {
+            let java: JavaSettings = serde_json::from_str(old).unwrap();
+            assert!(!java.jdtls_shared);
+        }
+        for shared in [false, true] {
+            let java = JavaSettings { jdtls_shared: shared, ..JavaSettings::default() };
+            let json = serde_json::to_value(&java).unwrap();
+            assert_eq!(json["jdtlsShared"], serde_json::json!(shared));
+            assert_eq!(serde_json::from_value::<JavaSettings>(json).unwrap(), java);
+        }
+        assert!(serde_json::from_str::<JavaSettings>(r#"{"jdtlsShared":"true"}"#).is_err());
     }
 }
 

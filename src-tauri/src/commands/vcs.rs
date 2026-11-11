@@ -368,8 +368,9 @@ pub async fn vcs_rename_branch(
     repo: Option<PathBuf>,
     from: String,
     to: String,
+    unset_upstream: bool,
 ) -> IdeResult<()> {
-    ide_host::ops::vcs::vcs_rename_branch(&state.host, window.label(), repo, from, to).await
+    ide_host::ops::vcs::vcs_rename_branch(&state.host, window.label(), repo, from, to, unset_upstream).await
 }
 
 #[tauri::command]
@@ -644,6 +645,18 @@ pub async fn vcs_add_worktree(
     new_branch: Option<String>,
 ) -> IdeResult<()> {
     ide_host::ops::vcs::vcs_add_worktree(&state.host, window.label(), repo, path, commitish, new_branch).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn vcs_move_worktree(
+    window: Window,
+    state: State<'_, AppState>,
+    repo: Option<PathBuf>,
+    path: PathBuf,
+    to: PathBuf,
+) -> IdeResult<()> {
+    ide_host::ops::vcs::vcs_move_worktree(&state.host, window.label(), repo, path, to).await
 }
 
 #[tauri::command]

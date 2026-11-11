@@ -15,11 +15,13 @@ import {
   useChangelists,
   validateListName,
 } from "./changelists";
-import { groupOf } from "./changes";
+import { changedPathsUnder, groupOf } from "./changes";
+import { addToVcs, addToVcsTargets } from "./changeOps";
 import { useCommit } from "./commitStore";
+import { isModalCommit, openCommit } from "./commitUi";
 import { confirmDialog, openDialog } from "./dialogs";
 import { fileCount, stripSlash } from "./model";
-import { useVcs } from "./store";
+import { refreshNow, useVcs } from "./store";
 import styles from "./common.module.css";
 import { tx } from "@/platform/i18n";
 
@@ -178,26 +180,50 @@ export function setActiveChangelist(id: string) {
   updateChangelists((s) => setActiveList(s, id));
 }
 
-/** Commit… on a change list: include exactly its changes and focus the message. */
+/**
+ * Commit… on a change list: include exactly its changes and focus the message — under
+ * the modal interface it is in the Commit dialog, which this opens.
+ */
 export function commitChangelist(id: string) {
   const { status, root } = useVcs.getState();
   const checks = checksForList(status, root ?? "", useChangelists.getState().state, id);
   useCommit.setState((s) => ({ checks, tab: "changes", focusTick: s.focusTick + 1 }));
+  if (isModalCommit()) openCommit();
 }
 
-/** Commit File…: include exactly these changes (absolute paths) and focus the message. */
+/**
+ * Commit File…: include exactly these changes (absolute paths) and focus the message —
+ * under the modal interface it is in the Commit dialog, which this opens.
+ */
 export function commitFiles(paths: readonly string[]) {
   const chosen = new Set(paths.map(stripSlash));
   const checks = new Map<string, "all" | "none">();
   for (const f of useVcs.getState().status)
     if (groupOf(f) === "changes") checks.set(f.path, chosen.has(stripSlash(f.path)) ? "all" : "none");
   useCommit.setState((s) => ({ checks, tab: "changes", focusTick: s.focusTick + 1 }));
+  if (isModalCommit()) openCommit();
 }
 
 /** Moves files (absolute paths) to a list. */
 export function moveToChangelist(paths: readonly string[], id: string) {
   const rels = paths.map(relOf);
   updateChangelists((s) => moveFiles(s, rels, id));
+}
+
+/**
+ * Adds files (absolute paths) to a list. Unversioned ones are added to Git first
+ * (IDEA's Unversioned Files behaviour), so the list gets them as changes.
+ */
+export async function addToChangelist(paths: readonly string[], id: string) {
+  if (!paths.length) return;
+  const untracked = addToVcsTargets(paths, useVcs.getState().status);
+  if (untracked.length) {
+    await addToVcs(untracked);
+    // `runOp` refreshes without waiting; changes only join the list once tracked.
+    await refreshNow();
+  }
+  const files = changedPathsUnder(paths, useVcs.getState().status);
+  if (files.length) moveToChangelist(files, id);
 }
 
 /** Move to Another Changelist… (F6 in the Commit tool window). */

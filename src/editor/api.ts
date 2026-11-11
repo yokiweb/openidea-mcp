@@ -28,11 +28,12 @@ import {
   type RangeSet,
   type Transaction,
 } from "@codemirror/state";
-import { GutterMarker, ViewPlugin, type EditorView } from "@codemirror/view";
+import { GutterMarker, ViewPlugin, type EditorView, type ViewUpdate } from "@codemirror/view";
 import type { LanguageDescription } from "@codemirror/language";
 import type { LineEnding } from "@/platform/ipc";
 import { create } from "zustand";
 import { maybeEditorService } from "@/workbench/contributions";
+import { cornerInset } from "@/editor/core/cm/cornerInset";
 
 /** Documents above this size (UTF-16 units) skip per-line decorations. */
 export const HEAVY_LIMIT = 8_000_000;
@@ -335,6 +336,22 @@ export class LaneMarker extends GutterMarker {
 }
 
 /**
+ * A gutter spacer that renders nothing: pair it with `gutter`'s `updateSpacer`
+ * to reserve icon width only while the file has something to show.
+ */
+export const emptyGutterSpacer = new (class extends GutterMarker {})();
+
+/** A gutter spacer reserving one icon of width, styled by `className`. */
+export const gutterSpacer = (className: string) =>
+  new (class extends GutterMarker {
+    override toDOM(): Node {
+      const el = document.createElement("span");
+      el.className = className;
+      return el;
+    }
+  })();
+
+/**
  * The floating row at the editor's top-right (IDEA's inspection widget area): widgets
  * append their element to it (CSS `order` sorts them; lower first) and remove it when
  * done. The inspection widget sits there; code review adds its Review Mode group.
@@ -358,6 +375,8 @@ export function editorCorner(view: EditorView): HTMLElement {
     gap: "4px",
   });
   view.dom.appendChild(el);
+  // The lines leave room for its measured width, so it never covers a line end.
+  view.plugin(cornerInset)?.track(el);
   return el;
 }
 
@@ -401,6 +420,17 @@ export interface ContributedIntention {
 
 /** A background provider has new context actions for the current document. */
 export const intentionsChanged = StateEffect.define<null>();
+
+/**
+ * A hidden editor view is shown again. Recently used tabs keep their view, detached from the
+ * document, while hidden; plugins that skip work while `view.dom` is disconnected redo it when
+ * `shownAgain`.
+ */
+export const viewShown = StateEffect.define<null>();
+
+export function shownAgain(u: ViewUpdate): boolean {
+  return u.transactions.some((tr) => tr.effects.some((e) => e.is(viewShown)));
+}
 
 /** Local fixes of a diagnostic range (hover link and Apply Quick Fix). */
 export const quickFixProviders = Facet.define<(view: EditorView, from: number, to: number) => ContributedIntention[]>();
@@ -456,6 +486,7 @@ export function _provideNavigationHistory(provider: () => NavigationHistorySnaps
 // --- editor events ------------------------------------------------------------
 
 export type EditorEvent =
+  | { type: "inputModeChanged"; path: string; mode: string; sub: string | null }
   | { type: "docOpened"; doc: number; path: string; language: string }
   | { type: "docClosed"; doc: number; path: string }
   /** After the backend wrote the file. */
@@ -464,6 +495,11 @@ export type EditorEvent =
   | { type: "activeEditorChanged"; path: string | null; doc: number | null }
   /** Caret moved in the active text editor (throttled to animation frames). 0-based. */
   | { type: "caretMoved"; doc: number; path: string; line: number; col: number; offset: number };
+
+/** Reports the focused editor's input mode from an editor contribution. */
+export function reportInputMode(path: string, mode: string, sub: string | null) {
+  _emitEditorEvent({ type: "inputModeChanged", path, mode, sub });
+}
 
 type EditorEventListener = (e: EditorEvent) => void;
 const editorEventListeners = new Set<EditorEventListener>();

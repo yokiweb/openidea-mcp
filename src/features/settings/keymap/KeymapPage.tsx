@@ -1,6 +1,6 @@
 /**
  * Keymap page (IDEA layout): keymap selector with a gear menu (Duplicate… /
- * Rename… / Restore Defaults / Delete), search by name or by recorded shortcut,
+ * Import IntelliJ IDEA Keymap… / Rename… / Restore Defaults / Delete), search by name or by recorded shortcut,
  * and the action tree grouped as Main Menu › File…Help, Editor Actions, Tool
  * Windows, Other, Plugins. Enter / double-click opens the context menu to add,
  * remove or reset shortcuts. Edits are staged as the `keymap`, `keymapOverrides`
@@ -9,8 +9,9 @@
 import { useMemo, useRef, useState, type MouseEvent } from "react";
 import clsx from "clsx";
 import { useActions, allActions, type Action } from "@/platform/actions";
-import { defaultPreset, formatBinding, type Keymap, PRESET_TITLES, PRESETS } from "@/platform/keymap";
-import { confirm } from "@/workbench/messages";
+import { defaultPreset, formatBinding, type Keymap, PRESET_TITLES, PRESETS, useKeymap } from "@/platform/keymap";
+import { call, commands } from "@/platform/ipc";
+import { ask, confirm, showError } from "@/workbench/messages";
 import {
   HighlightedText,
   Icon,
@@ -36,6 +37,7 @@ import {
   deleteKeymap,
   duplicateKeymap,
   isModified,
+  isKeymapAction,
   keymapName,
   removeBinding,
   removeConflicts,
@@ -43,12 +45,14 @@ import {
   resetBindings,
   resolveBindings,
   switchPreset,
+  validateKeymapName,
   withCustomOverrides,
   type CustomKeymaps,
   type KeymapDraft,
 } from "./model";
 import { groupIcon, groupPath, groupRank } from "./groups";
 import { KeymapNameDialog } from "./KeymapDialogs";
+import { parseIdeaKeymap } from "./ideaKeymapImport";
 import { RecordShortcutDialog } from "./RecordShortcutDialog";
 import { StrokeRecorder } from "./StrokeRecorder";
 import styles from "./Keymap.module.css";
@@ -61,8 +65,9 @@ type KNode =
 type GroupNode = Extract<KNode, { kind: "group" }>;
 
 export function keymapSearchLabels(): string[] {
+  const draft = useKeymap.getState();
   return allActions()
-    .filter((a) => !a.hidden)
+    .filter((a) => isKeymapAction(a, draft))
     .map((a) => a.title);
 }
 
@@ -107,7 +112,7 @@ export function buildKeymapTree(
   const q = query.toLowerCase();
   for (const action of actions) {
     const bindings = resolveBindings(draft, action.id);
-    if (action.hidden && !bindings.length) continue;
+    if (!isKeymapAction(action, draft)) continue;
     let hits: number[] | null = null;
     if (query) {
       hits = wordMatch(action.title, query);
@@ -225,12 +230,44 @@ export function KeymapPage() {
     setSelected(next.selected);
   };
 
+  const importIdeaKeymap = async () => {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const path = await open({ multiple: false, filters: [{ name: tx("IntelliJ IDEA Keymap"), extensions: ["xml"] }] });
+    if (!path) return;
+    let parsed;
+    try {
+      parsed = parseIdeaKeymap(await call(commands.fsReadText(path)));
+    } catch (e) {
+      await showError(tx("Import Keymap"), e instanceof Error ? e.message : String(e));
+      return;
+    }
+    const name = validateKeymapName(parsed.name, customs) ? copyName(parsed.name, customs) : parsed.name;
+    const next = duplicateKeymap({ preset: parsed.parent, overrides: parsed.overrides }, customs, name);
+    setCustoms(next.customs);
+    setSelected(next.id);
+    const unknown = parsed.unknownActions;
+    await ask({
+      title: tx("Import Keymap"),
+      body: (
+        <>
+          <div>
+            {tx`Imported '${name}' (based on ${PRESET_TITLES[parsed.parent] ?? parsed.parent}): ${parsed.applied} actions.`}
+          </div>
+          {unknown.length > 0 && <div>{tx`Not available in OpenIDEA (${unknown.length}): ${unknown.join(", ")}.`}</div>}
+          {parsed.skippedShortcuts > 0 && <div>{tx`Skipped ${parsed.skippedShortcuts} unsupported shortcuts.`}</div>}
+        </>
+      ),
+      buttons: [{ id: "ok", label: tx("OK"), primary: true }],
+    });
+  };
+
   const gearMenu = (): MenuItem[] => [
     {
       label: "Duplicate…",
       icon: "copy",
       run: () => setNameDialog({ mode: "duplicate", initial: copyName(keymapName(selectedId, customs), customs) }),
     },
+    { label: "Import IntelliJ IDEA Keymap…", run: () => void importIdeaKeymap() },
     {
       label: "Rename…",
       icon: "edit",

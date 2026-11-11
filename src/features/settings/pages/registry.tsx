@@ -1,4 +1,6 @@
 /** Registers the built-in pages as ordinary settings-page contributions and indexes their labels. */
+import { commands } from "@/platform/ipc";
+import { UPDATES_PAGE } from "./updates";
 import { onLanguageListChanged } from "@/platform/languageList";
 import { registerSettingsPage, type SettingsPageContribution } from "@/workbench/contributions";
 import { BEHAVIOR_PAGES } from "./behavior";
@@ -7,7 +9,6 @@ import { DEPLOYMENT_PAGES } from "./deployment";
 import { EDITOR_PAGES, codeStyleLanguagePages } from "./editor";
 import { EXECUTION_PAGES } from "./execution";
 import { LANGUAGE_PAGES } from "./languages";
-import { MCP_PAGES } from "./mcp";
 import { OptionsPage } from "./OptionsPage";
 import { RUN_TARGET_PAGES } from "./runTargets";
 import { specLabels, type PageSpec } from "./spec";
@@ -17,6 +18,7 @@ import { VCS_PAGES } from "./vcs";
 
 const BUILTIN_PAGES = [
   ...BEHAVIOR_PAGES,
+  UPDATES_PAGE,
   ...CORE_PAGES,
   ...EDITOR_PAGES,
   ...VCS_PAGES,
@@ -24,7 +26,6 @@ const BUILTIN_PAGES = [
   ...DEPLOYMENT_PAGES,
   ...RUN_TARGET_PAGES,
   ...TOOLS_PAGES,
-  ...MCP_PAGES,
   ...SSH_PAGES,
   ...LANGUAGE_PAGES,
 ];
@@ -57,9 +58,17 @@ function toContribution(spec: PageSpec): SettingsPageContribution {
 }
 
 export function registerBuiltinPages(): () => void {
-  const disposers = BUILTIN_PAGES.map((spec) => registerSettingsPage(toContribution(spec)));
+  const disposers = BUILTIN_PAGES.filter((spec) => spec !== UPDATES_PAGE).map((spec) =>
+    registerSettingsPage(toContribution(spec)),
+  );
   // Code Style › <Language> pages come from the backend's language list, which plugins change.
   let live = true;
+  void commands
+    .appBuildInfo()
+    .then((info) => {
+      if (live && info.updates) disposers.push(registerSettingsPage(toContribution(UPDATES_PAGE)));
+    })
+    .catch(() => {});
   let languagePages: (() => void)[] = [];
   let generation = 0;
   const loadLanguagePages = () => {
