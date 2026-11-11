@@ -326,7 +326,7 @@ export function runServiceItems(
         key: CONFIG_PREFIX + c.id,
         label: c.name,
         icon: serviceDebugger(s) ? "debug" : live || !!ext ? "run" : configIcon(c),
-        detail: ext ? `MCP · PID ${ext.pid ?? "?"}` : executionDetail(s),
+        detail: ext ? tx`MCP · PID ${ext.pid ?? "?"}` : executionDetail(s),
         dim: !ext && !live,
       };
     });

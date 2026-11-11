@@ -1,174 +1,154 @@
-//! The IDE's MCP server: AI agents (any MCP client) manage the project's run
-//! configurations ("services") and query its data sources over stdio.
+//! The IDE's MCP server: AI agents outside the IDE (Claude Code, Codex…) call
+//! the IDE's built-in tools.
 //!
-//! - Launch: `<openidea> --mcp [--project <path>] [--allow-write]`, handled
-//!   before the UI starts; this process has no windows. `--project` defaults
-//!   to the current directory.
-//! - It shares the desktop app's config / data directories, so project trust
-//!   and saved data source passwords apply exactly as configured in the UI.
-//! - Tools: services (`list_services`, `start_service`, `stop_service`,
-//!   `restart_service`, `get_service_logs`) and database
-//!   (`list_datasources`, `execute_query`). Queries are read-only unless the
-//!   server was started with `--allow-write`.
+//! - **Transport:** MCP Streamable HTTP (2025-06-18; 2025-03-26 and 2024-11-05
+//!   clients too) on `127.0.0.1:<random port>`, endpoint `/mcp`. Responses are
+//!   plain JSON (no SSE streams: `GET` is 405). Every request carries
+//!   `Authorization: Bearer <token>` (random, per run); requests from another
+//!   `Origin` or `Host` are refused (DNS rebinding).
+//! - **Projects:** the `X-OpenIDEA-Project` header or the `?project=` query
+//!   names a folder; the server picks the open project containing it.
+//! - **Discovery:** `<app-data>/mcp/server.json` (`port`, `token`, `pid`,
+//!   `version`; readable only by the user) while the server runs.
+//! - **Stdio:** `<app exe> --mcp-stdio [--project <path>]` reads the discovery
+//!   file and relays newline-delimited JSON-RPC to the server ([`stdio`]), so
+//!   persisted client configurations hold no token.
 //!
-//! Limitations: runs started by the tools are children of this process, so
-//! the GUI's Services tool window does not show them, and `get_service_logs`
-//! only covers runs these tools started (the IDE streams console output to
-//! the UI without keeping it).
+//! The tools themselves come from a [`ToolRegistry`] (the IDE host); this
+//! crate knows nothing about plugins.
 
-pub mod guard;
-pub mod http;
+mod discovery;
+mod protocol;
 mod server;
-mod tools;
+pub mod stdio;
 
-use ide_host::{Host, HostConfig};
-use ide_language::LanguageRegistry;
-use rmcp::ServiceExt;
-use std::path::PathBuf;
-use std::sync::Arc;
+pub use discovery::{DISCOVERY_FILE, Discovery, discovery_path};
+pub use server::{McpServer, new_token};
+pub use tokio_util::sync::CancellationToken;
 
-/// The one project this process serves (its window label too).
-const WINDOW: &str = "mcp";
+use std::path::{Path, PathBuf};
 
-/// The desktop app's identifier; its config / data directories are shared.
-const IDENTIFIER: &str = "ai.l0ng.openidea";
+/// The header naming the project a request is about (an absolute path).
+pub const PROJECT_HEADER: &str = "x-openidea-project";
+/// The command-line flag that runs the executable as the stdio bridge.
+pub const STDIO_FLAG: &str = "--mcp-stdio";
 
-/// The MCP mode's CLI. [`None`] when `--mcp` is absent, so the caller starts
-/// the UI as usual; otherwise returns the process exit code.
-pub fn try_main() -> Option<i32> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.iter().any(|a| a == "--mcp") {
+/// A tool as `tools/list` shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    /// A JSON Schema of the `arguments` object.
+    pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
+    /// Only reads (`annotations.readOnlyHint`).
+    pub read_only: bool,
+    /// May destroy data (`annotations.destructiveHint`).
+    pub destructive: bool,
+}
+
+/// A failed `tools/call`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolCallError {
+    /// No such tool for the project: a protocol error.
+    UnknownTool(String),
+    /// The tool ran and failed, or couldn't run: a result with `isError`.
+    Failed(String),
+}
+
+/// Where the tools come from (the IDE host). Calls block; the server runs
+/// them off its async threads.
+pub trait ToolRegistry: Send + Sync + 'static {
+    /// Roots of the projects open in the IDE that the server serves.
+    fn projects(&self) -> Vec<PathBuf>;
+    /// The tools callable for `project` (one of [`Self::projects`]). `Err`
+    /// says why there are none (an unsupported project).
+    fn tools(&self, project: &Path) -> Result<Vec<Tool>, String>;
+    fn call_with_client(
+        &self,
+        project: &Path,
+        name: &str,
+        arguments: &str,
+        cancel: CancellationToken,
+        _client: &str,
+    ) -> Result<String, ToolCallError> {
+        self.call(project, name, arguments, cancel)
+    }
+
+    /// Runs tool `name` with `arguments` (a JSON object, as text) for `project`.
+    fn call(
+        &self,
+        project: &Path,
+        name: &str,
+        arguments: &str,
+        cancel: CancellationToken,
+    ) -> Result<String, ToolCallError>;
+}
+
+/// The URL of the server at `port` for `project`.
+pub fn endpoint_url(port: u16, project: &Path) -> String {
+    format!("http://127.0.0.1:{port}/mcp?project={}", encode_query(&project.to_string_lossy()))
+}
+
+/// The stdio bridge's command line for `project`: `exe --mcp-stdio --project <project>`.
+pub fn stdio_command(exe: &Path, project: &Path) -> Vec<String> {
+    vec![
+        exe.to_string_lossy().into_owned(),
+        STDIO_FLAG.to_owned(),
+        "--project".to_owned(),
+        project.to_string_lossy().into_owned(),
+    ]
+}
+
+/// Whether `args` (the process's, program name first) ask for the stdio
+/// bridge; then the project it is for (`--project <path>`, `None`: the
+/// current directory).
+pub fn stdio_request(args: &[String]) -> Option<Option<PathBuf>> {
+    let rest = args.get(1..).unwrap_or_default();
+    if !rest.iter().any(|a| a == STDIO_FLAG) {
         return None;
     }
-    let mut project: Option<PathBuf> = None;
-    let mut allow_write = false;
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            "--mcp" => {}
-            "--allow-write" => allow_write = true,
-            "--project" => match rest.next() {
-                Some(path) => project = Some(PathBuf::from(path)),
-                None => {
-                    eprintln!("openidea --mcp: --project needs a path");
-                    return Some(2);
-                }
-            },
-            other => {
-                eprintln!("openidea --mcp: unknown argument {other}");
-                eprintln!("usage: openidea --mcp [--project <path>] [--allow-write]");
-                return Some(2);
-            }
-        }
-    }
-    let project = project.map_or_else(std::env::current_dir, |p| {
-        if p.is_absolute() { Ok(p) } else { std::env::current_dir().map(|cwd| cwd.join(p)) }
-    });
-    let project = match project {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("openidea --mcp: cannot resolve the project path: {e}");
-            return Some(1);
-        }
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build();
-    let runtime = match runtime {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("openidea --mcp: {e}");
-            return Some(1);
-        }
-    };
-    let code = runtime.block_on(serve(project, allow_write));
-    // Nothing started for the client may outlive it.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-    Some(code)
+    let project = rest
+        .iter()
+        .position(|a| a == "--project")
+        .and_then(|i| rest.get(i + 1))
+        .map(PathBuf::from)
+        .or_else(|| rest.iter().find_map(|a| a.strip_prefix("--project=").map(PathBuf::from)));
+    Some(project)
 }
 
-async fn serve(project: PathBuf, allow_write: bool) -> i32 {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("OPENIDEA_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
-    let (config_dir, data_dir, local_data_dir) = match app_dirs(IDENTIFIER) {
-        Some(dirs) => dirs,
-        None => {
-            eprintln!("openidea --mcp: cannot locate the app data directories");
-            return 1;
-        }
-    };
-    for dir in [&config_dir, &data_dir, &local_data_dir] {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("openidea --mcp: cannot create {}: {e}", dir.display());
-            return 1;
-        }
-    }
-    // An MCP client's environment is minimal: take the login shell's, plus the
-    // IDE-managed tools, so services find `java`, `mvn`, `node`…
-    ide_host::shell_env::inherit_login_shell_env("openidea-mcp");
-    ide_tools::extend_process_path(&local_data_dir);
-    ide_sdk::java::add_jdk_root(&ide_tools::jdk::jdks_dir(&local_data_dir));
-    let languages = match LanguageRegistry::load(Some(&config_dir.join("languages"))) {
-        Ok(l) => Arc::new(l),
-        Err(e) => {
-            eprintln!("openidea --mcp: language definitions: {e}");
-            return 1;
-        }
-    };
-    let host = Arc::new(Host::new(HostConfig {
-        config_dir,
-        data_dir,
-        local_data_dir,
-        languages,
-        syntax: Arc::default(),
-        sink_for: Box::new(|_| Arc::new(ide_core::NullSink)),
-        owner: |w| w,
-        runtime: tokio::runtime::Handle::current(),
-        project_environment: false,
-    }));
-    if let Err(e) = ide_host::ops::project::open(&host, WINDOW, &project).await {
-        eprintln!("openidea --mcp: cannot open {}: {e}", project.display());
-        return 1;
-    }
-    if let Err(e) = host.require_trust(WINDOW) {
-        eprintln!("openidea --mcp: {} is not trusted; open it in OpenIDEA once and trust it ({e})", project.display());
-        return 1;
-    }
-    let server = server::OpenIdeaMcp::new(host, allow_write, WINDOW);
-    match server.serve(rmcp::transport::stdio()).await {
-        Ok(running) => {
-            let _ = running.waiting().await;
-            0
-        }
-        Err(e) => {
-            eprintln!("openidea --mcp: {e}");
-            1
-        }
-    }
+/// Characters escaped in a query value: everything but unreserved characters and `/`.
+const QUERY: &percent_encoding::AsciiSet =
+    &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~').remove(b'/');
+
+pub(crate) fn encode_query(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, QUERY).to_string()
 }
 
-/// The desktop app's config / data / local-data directories (`Tauri`'s
-/// `app_config_dir` / `app_data_dir` / `app_local_data_dir`).
-fn app_dirs(identifier: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
-    #[cfg(windows)]
-    {
-        Some((
-            dirs::config_dir()?.join(identifier),
-            dirs::data_dir()?.join(identifier),
-            dirs::data_local_dir()?.join(identifier),
-        ))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls_and_commands_name_the_project() {
+        let url = endpoint_url(4321, Path::new("/home/me/my app/项目"));
+        assert_eq!(url, "http://127.0.0.1:4321/mcp?project=/home/me/my%20app/%E9%A1%B9%E7%9B%AE");
+        assert_eq!(
+            stdio_command(Path::new("/Applications/OpenIDEA.app/Contents/MacOS/openidea"), Path::new("/p")),
+            ["/Applications/OpenIDEA.app/Contents/MacOS/openidea", "--mcp-stdio", "--project", "/p"]
+        );
     }
-    #[cfg(target_os = "macos")]
-    {
-        let base = dirs::data_dir()?.join(identifier);
-        Some((base.clone(), base.clone(), base))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Some((
-            dirs::config_dir()?.join(identifier),
-            dirs::data_dir()?.join(identifier),
-            dirs::data_dir()?.join(identifier),
-        ))
+
+    #[test]
+    fn stdio_requests_are_recognized() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(stdio_request(&args(&["openidea"])), None);
+        assert_eq!(stdio_request(&args(&["openidea", "/some/project"])), None);
+        assert_eq!(stdio_request(&args(&["openidea", "--mcp-stdio"])), Some(None));
+        assert_eq!(
+            stdio_request(&args(&["openidea", "--mcp-stdio", "--project", "/p"])),
+            Some(Some(PathBuf::from("/p")))
+        );
+        assert_eq!(stdio_request(&args(&["openidea", "--project=/q", "--mcp-stdio"])), Some(Some(PathBuf::from("/q"))));
     }
 }

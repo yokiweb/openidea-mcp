@@ -8,6 +8,17 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	appInfo: () => __TAURI_INVOKE<AppInfo>("app_info"),
+	mcpUiReady: (ready: boolean) => typedError<null, IdeError>(__TAURI_INVOKE("mcp_ui_ready", { ready })),
+	mcpRespond: (id: number, allow: boolean, error: string | null) => typedError<null, IdeError>(__TAURI_INVOKE("mcp_respond", { id, allow, error })),
+	mcpServerStatus: () => typedError<McpServerStatus, IdeError>(__TAURI_INVOKE("mcp_server_status")),
+	mcpSetOpenEditors: (paths: IpcPath[]) => typedError<null, IdeError>(__TAURI_INVOKE("mcp_set_open_editors", { paths })),
+	mcpSetFocusedEditor: (editor: {
+	path: IpcPath,
+	/**  Zero-based lines and UTF-16 columns, end exclusive. */
+	selection: Range,
+	selectedText: string,
+} | null, focused: boolean) => typedError<null, IdeError>(__TAURI_INVOKE("mcp_set_focused_editor", { editor, focused })),
+	mcpReportProblems: (reset: boolean, files: FileProblems[]) => typedError<null, IdeError>(__TAURI_INVOKE("mcp_report_problems", { reset, files })),
 	/**  Devices `adb` knows about, online ones first. */
 	androidDevices: () => typedError<AndroidDevice[], IdeError>(__TAURI_INVOKE("android_devices")),
 	/**
@@ -344,11 +355,9 @@ export const commands = {
 } | null) => typedError<null, IdeError>(__TAURI_INVOKE("caches_schedule_invalidation", { options })),
 	/**  Quits through every window's unsaved-changes check, then starts again. */
 	appRestart: () => __TAURI_INVOKE<void>("app_restart"),
-	mcpServerStatus: () => typedError<McpServerStatus, IdeError>(__TAURI_INVOKE("mcp_server_status")),
 	/**
-	 *  Saves `enabled` / `port` / `allow_write` and applies them: starts the server
-	 *  on the calling window's project, or stops it. Restarts when the address or
-	 *  the project changes while it runs.
+	 *  Saves `enabled` / `port` / `allow_write` and applies them: starts the
+	 *  server, restarts it when the address changed, or stops it.
 	 */
 	mcpServerApply: (enabled: boolean, port: number, allowWrite: boolean) => typedError<McpServerStatus, IdeError>(__TAURI_INVOKE("mcp_server_apply", { enabled, port, allowWrite })),
 	indexStatus: () => typedError<IndexStatus, IdeError>(__TAURI_INVOKE("index_status")),
@@ -986,6 +995,10 @@ export const commands = {
 	 */
 	menuSetDisabled: (ids: string[]) => __TAURI_INVOKE<void>("menu_set_disabled", { ids }),
 	appLogLocation: () => typedError<LogLocation, IdeError>(__TAURI_INVOKE("app_log_location")),
+	/**  Installs the `openidea` command for this user. */
+	appCliInstall: () => typedError<CliInstallation, IdeError>(__TAURI_INVOKE("app_cli_install")),
+	/**  Removes the installed `openidea` command; returns the links removed. */
+	appCliUninstall: () => typedError<IpcPath[], IdeError>(__TAURI_INVOKE("app_cli_uninstall")),
 	appBuildInfo: () => __TAURI_INVOKE<BuildInfo>("app_build_info"),
 	appCheckUpdate: (source: UpdateSource) => typedError<UpdateCheck, IdeError>(__TAURI_INVOKE("app_check_update", { source })),
 	/**
@@ -2289,6 +2302,11 @@ export type ClearCachesResult = {
 	syntaxTrees: number,
 	rssBeforeBytes: number | null,
 	rssAfterBytes: number | null,
+};
+
+export type CliInstallation = {
+	path: IpcPath,
+	pathDirectory: IpcPath | null,
 };
 
 export type CloseContext = {
@@ -3954,6 +3972,11 @@ export type FileProbe = {
 	tooLarge: boolean,
 };
 
+export type FileProblems = {
+	path: IpcPath,
+	items: Diagnostic[],
+};
+
 /**  A path written in a document: an HTML URL attribute, a CSS `url()` / `@import`. */
 export type FileReference = {
 	range: Range,
@@ -4020,6 +4043,13 @@ export type FilesChanged = {
 	created: string[],
 	modified: string[],
 	removed: string[],
+};
+
+export type FocusedEditor = {
+	path: IpcPath,
+	/**  Zero-based lines and UTF-16 columns, end exclusive. */
+	selection: Range,
+	selectedText: string,
 };
 
 export type FoldKind = "region" | "comment" | "imports";
@@ -4529,7 +4559,7 @@ export type IdeError = {
 	data?: ErrorData | null,
 };
 
-export type IdeEvent = 
+export type IdeEvent = { type: "mcpRequest"; id: number; request: McpUiRequest } | { type: "mcpRequestClosed"; id: number } | 
 /**  Project window membership or selection changed. */
 { type: "windowGroupsChanged" } | 
 /**  A window entered or left full screen, itself or as a member of a full-screen window group. */
@@ -5594,25 +5624,32 @@ export type MavenSettings = {
 	threads?: string,
 };
 
-/**  What the settings page shows: the saved configuration plus live state. */
+/**  Tools › MCP Server: agents use the IDE's built-in tools. */
+export type McpServerSettings = {
+	/**  Serve the tools on 127.0.0.1 while the IDE runs. */
+	enabled?: boolean,
+};
+
+/**  What Settings › Tools › MCP Server shows. */
 export type McpServerStatus = {
-	/**  Saved switch: start the server on the next Apply of this page's scope. */
+	/**  保存的开关（`mcp.json`）。 */
 	enabled: boolean,
 	running: boolean,
+	/**  Why it isn't running though turned on. */
+	error: string | null,
 	port: number,
 	allowWrite: boolean,
-	/**
-	 *  Bearer token MCP clients must send; regenerated never (a stable one keeps
-	 *  client configurations valid across restarts).
-	 */
+	/**  Bearer token MCP clients send; stable across restarts. */
 	token: string,
-	/**  The root of the project the running server serves. */
-	project: string | null,
-	/**  Why the last start failed, until the next attempt. */
-	error: string | null,
-	/**  `[exe, "--mcp", "--project", <root>]`: the stdio client configuration. */
+	/**  The window's local project, which the URL and command below are for. */
+	project: IpcPath | null,
+	/**  `http://127.0.0.1:<port>/mcp?project=<root>`. */
+	url: string | null,
+	/**  The stdio bridge: this executable and its arguments. */
 	stdioCommand: string[],
 };
+
+export type McpUiRequest = { type: "confirm"; client: string; tool: string; subject: string; project: string; detail: string | null } | { type: "openFile"; path: IpcPath; line: number | null; column: number | null };
 
 export type MemoryCategory = 
 /**  The backend and its WebView processes. */
@@ -7391,6 +7428,8 @@ export type Settings_Deserialize = {
 	cmake?: CMakeSettings_Deserialize,
 	/**  Tools › Agents › Chat. */
 	agents?: AgentSettings,
+	/**  Tools › MCP Server (global only). */
+	mcpServer?: McpServerSettings,
 	/**  Plugin settings (`[contributes.settings]`): plugin id → its values by key. */
 	plugins?: { [key in string]: { [key in string]: unknown } },
 };
@@ -7451,6 +7490,8 @@ export type Settings_Serialize = {
 	cmake: CMakeSettings_Serialize,
 	/**  Tools › Agents › Chat. */
 	agents: AgentSettings,
+	/**  Tools › MCP Server (global only). */
+	mcpServer: McpServerSettings,
 	/**  Plugin settings (`[contributes.settings]`): plugin id → its values by key. */
 	plugins: { [key in string]: { [key in string]: unknown } },
 };
@@ -7823,7 +7864,7 @@ export type SyntaxErrors = {
 };
 
 /**  Highlight classes sent to the UI, which maps each onto a Lezer tag. */
-export type SyntaxHighlightKind = "keyword" | "string" | "stringSpecial" | "escape" | "regexp" | "atom" | "number" | "constant" | "comment" | "docComment" | "function" | "functionCall" | "builtin" | "type" | "namespace" | "variable" | "selfVariable" | "property" | "attribute" | "macro" | "label" | "tag" | "operator" | "punctuation";
+export type SyntaxHighlightKind = "keyword" | "string" | "stringSpecial" | "escape" | "regexp" | "atom" | "number" | "constant" | "comment" | "docComment" | "function" | "functionCall" | "builtin" | "type" | "namespace" | "variable" | "selfVariable" | "property" | "attribute" | "macro" | "label" | "tag" | "operator" | "punctuation" | "parameter";
 
 /**  Highlighted ranges of a whole document, packed like LSP semantic tokens. */
 export type SyntaxHighlights = {
