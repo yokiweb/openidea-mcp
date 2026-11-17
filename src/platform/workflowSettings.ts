@@ -19,6 +19,7 @@ export interface IssueLinkValid {
 
 export interface GitSettingsValid {
   inlineBlame: boolean;
+  inlineBlameClickable: boolean;
   showBranchInProjectView: boolean;
   executable: string;
   updateMethod: UpdateMethod;
@@ -26,6 +27,8 @@ export interface GitSettingsValid {
   warnCrlf: boolean;
   warnDetachedHead: boolean;
   incomingCheck: IncomingCheck;
+  /** Minutes between background checks for incoming commits. */
+  incomingCheckInterval: number;
   protectedBranches: string;
   signOff: boolean;
   warnLargeFiles: boolean;
@@ -34,6 +37,7 @@ export interface GitSettingsValid {
   showPushDialog: boolean;
   pushDialogOnlyProtected: boolean;
   combineStashAndShelf: boolean;
+  stagingArea: boolean;
 }
 
 export interface CommitSettingsValid {
@@ -74,26 +78,40 @@ export interface VcsSettingsValid {
   issueNavigation: IssueLinkValid[];
 }
 
+/** Mirrors `ide-core::workflow_settings::LogLevelColors` defaults. */
+export interface LogLevelColorsValid {
+  enabled: boolean;
+  error: string;
+  warn: string;
+  info: string;
+  debug: string;
+  trace: string;
+}
+
 export interface ConsoleSettingsValid {
   softWrap: boolean;
   overrideBuffer: boolean;
   bufferKb: number;
   encoding: string;
   foldPatterns: string[];
+  logColors: LogLevelColorsValid;
 }
 
 export interface DebuggerSettingsValid {
   showOnBreakpoint: boolean;
   focusAppOnBreakpoint: boolean;
   hideOnTermination: boolean;
+  variablesOnBreakpoint: boolean;
   breakpointsAnyFile: boolean;
   runToCursorInlay: boolean;
   inlineValues: boolean;
   sortValues: boolean;
+  liveWatches: boolean;
   valueTooltip: boolean;
   valueTooltipOnSelection: boolean;
   valueTooltipDelay: number;
   skipLibraryCode: boolean;
+  debugServerPage: boolean;
   python: { attachSubprocess: boolean; gevent: boolean };
 }
 
@@ -102,7 +120,17 @@ export interface RunSettingsValid {
   confirmRerun: boolean;
   confirmTerminate: boolean;
   showOnStart: boolean;
+  /** New Run/Debug tabs start pinned, so a later run doesn't take their place (IDEA's advanced setting). */
+  pinTabs: boolean;
   terminationTimeoutMs: number;
+}
+
+/** Tools › External Diff Tools: the program Show Diff in External Tool starts. */
+export interface ExternalDiffValid {
+  enabled: boolean;
+  path: string;
+  /** `%1` the left file, `%2` the right file, `%3` the title. */
+  parameters: string;
 }
 
 export interface TerminalSettingsValid {
@@ -149,6 +177,19 @@ export interface ExternalToolValid {
   openConsole: boolean;
 }
 
+export interface AgentSecurityValid {
+  allowedCommands: string[];
+  blockedCommands: string[];
+}
+
+/** Agents › IDE MCP Server: the Run tool window's agent tabs (`run_command`). */
+export interface AgentRunSettingsValid {
+  /** Finished agent tabs shown; older ones go to the archive. */
+  tabLimit: number;
+  /** Archived agent tabs kept; older ones are closed. */
+  archiveLimit: number;
+}
+
 export interface WorkflowSettings extends RemoteSettings {
   vcs: VcsSettingsValid;
   console: ConsoleSettingsValid;
@@ -157,15 +198,20 @@ export interface WorkflowSettings extends RemoteSettings {
   terminal: TerminalSettingsValid;
   actionsOnSave: ActionsOnSaveValid;
   externalTools: ExternalToolValid[];
+  externalDiff: ExternalDiffValid;
+  agentSecurity: AgentSecurityValid;
 }
 
 export const WORKFLOW_LIMITS = {
   historyLimit: { min: 10, max: 100_000 },
   messageLimit: { min: 20, max: 500 },
   largeFileMb: { min: 1, max: 100_000 },
+  incomingCheckInterval: { min: 1, max: 1440 },
   bufferKb: { min: 16, max: 1_048_576 },
   tooltipDelay: { min: 0, max: 10_000 },
   terminationTimeoutMs: { min: 0, max: 600_000 },
+  agentTabLimit: { min: 0, max: 1000 },
+  agentArchiveLimit: { min: 0, max: 100_000 },
   terminalFontSize: { min: 6, max: 72 },
   terminalLineHeight: { min: 0.5, max: 3 },
   terminalColumnWidth: { min: 0.5, max: 2 },
@@ -192,6 +238,7 @@ export const DEFAULT_WORKFLOW: WorkflowSettings = {
     historyLimit: 1000,
     git: {
       inlineBlame: false,
+      inlineBlameClickable: true,
       showBranchInProjectView: false,
       executable: "",
       updateMethod: "merge",
@@ -199,6 +246,7 @@ export const DEFAULT_WORKFLOW: WorkflowSettings = {
       warnCrlf: true,
       warnDetachedHead: true,
       incomingCheck: "auto",
+      incomingCheckInterval: 15,
       protectedBranches: "master; main",
       signOff: false,
       warnLargeFiles: true,
@@ -207,6 +255,7 @@ export const DEFAULT_WORKFLOW: WorkflowSettings = {
       showPushDialog: true,
       pushDialogOnlyProtected: false,
       combineStashAndShelf: false,
+      stagingArea: false,
     },
     commit: {
       nonModal: true,
@@ -248,22 +297,40 @@ export const DEFAULT_WORKFLOW: WorkflowSettings = {
       "at node:internal/",
       "<frozen importlib._bootstrap",
     ],
+    logColors: {
+      enabled: false,
+      error: "var(--ansi-red)",
+      warn: "var(--ansi-yellow)",
+      info: "var(--ansi-green)",
+      debug: "var(--ansi-cyan)",
+      trace: "var(--ansi-magenta)",
+    },
   },
   debugger: {
     showOnBreakpoint: true,
     focusAppOnBreakpoint: false,
     hideOnTermination: false,
+    variablesOnBreakpoint: true,
     breakpointsAnyFile: false,
     runToCursorInlay: true,
     inlineValues: true,
     sortValues: false,
+    liveWatches: false,
     valueTooltip: true,
     valueTooltipOnSelection: true,
     valueTooltipDelay: 700,
     skipLibraryCode: true,
+    debugServerPage: false,
     python: { attachSubprocess: true, gevent: false },
   },
-  run: { defaultTarget: "", confirmRerun: true, confirmTerminate: true, showOnStart: true, terminationTimeoutMs: 3000 },
+  run: {
+    defaultTarget: "",
+    confirmRerun: true,
+    confirmTerminate: true,
+    showOnStart: true,
+    pinTabs: false,
+    terminationTimeoutMs: 3000,
+  },
   terminal: {
     startDirectory: "",
     env: {},
@@ -291,6 +358,11 @@ export const DEFAULT_WORKFLOW: WorkflowSettings = {
   },
   actionsOnSave: { optimizeImports: false, cleanup: false },
   externalTools: [],
+  externalDiff: { enabled: false, path: "", parameters: "%1 %2 %3" },
+  agentSecurity: {
+    allowedCommands: [],
+    blockedCommands: ["rm -rf *", "rm -rf /", "mkfs*", "dd *", ":(){ :|:& };:", "shutdown*", "reboot*"],
+  },
   ...DEFAULT_REMOTE,
 };
 
@@ -325,6 +397,7 @@ export function validateVcs(raw: unknown): VcsSettingsValid {
     historyLimit: num(v.historyLimit, d.historyLimit, L.historyLimit, true),
     git: {
       inlineBlame: bool(g.inlineBlame, d.git.inlineBlame),
+      inlineBlameClickable: bool(g.inlineBlameClickable, d.git.inlineBlameClickable),
       showBranchInProjectView: bool(g.showBranchInProjectView, d.git.showBranchInProjectView),
       executable: text(g.executable, d.git.executable).trim(),
       updateMethod: oneOf(g.updateMethod, ["merge", "rebase"] as const, d.git.updateMethod),
@@ -332,6 +405,7 @@ export function validateVcs(raw: unknown): VcsSettingsValid {
       warnCrlf: bool(g.warnCrlf, d.git.warnCrlf),
       warnDetachedHead: bool(g.warnDetachedHead, d.git.warnDetachedHead),
       incomingCheck: oneOf(g.incomingCheck, ["auto", "always", "never"] as const, d.git.incomingCheck),
+      incomingCheckInterval: num(g.incomingCheckInterval, d.git.incomingCheckInterval, L.incomingCheckInterval, true),
       protectedBranches: text(g.protectedBranches, d.git.protectedBranches),
       signOff: bool(g.signOff, d.git.signOff),
       warnLargeFiles: bool(g.warnLargeFiles, d.git.warnLargeFiles),
@@ -340,6 +414,7 @@ export function validateVcs(raw: unknown): VcsSettingsValid {
       showPushDialog: bool(g.showPushDialog, d.git.showPushDialog),
       pushDialogOnlyProtected: bool(g.pushDialogOnlyProtected, d.git.pushDialogOnlyProtected),
       combineStashAndShelf: bool(g.combineStashAndShelf, d.git.combineStashAndShelf),
+      stagingArea: bool(g.stagingArea, d.git.stagingArea),
     },
     commit: {
       nonModal: bool(c.nonModal, d.commit.nonModal),
@@ -379,12 +454,22 @@ export function validateVcs(raw: unknown): VcsSettingsValid {
 export function validateConsole(raw: unknown): ConsoleSettingsValid {
   const d = DEFAULT_WORKFLOW.console;
   const v = obj(raw);
+  const lc = obj(v.logColors);
+  const dl = d.logColors;
   return {
     softWrap: bool(v.softWrap, d.softWrap),
     overrideBuffer: bool(v.overrideBuffer, d.overrideBuffer),
     bufferKb: num(v.bufferKb, d.bufferKb, WORKFLOW_LIMITS.bufferKb, true),
     encoding: nonEmpty(v.encoding, d.encoding),
     foldPatterns: strings(v.foldPatterns, d.foldPatterns),
+    logColors: {
+      enabled: bool(lc.enabled, dl.enabled),
+      error: nonEmpty(lc.error, dl.error),
+      warn: nonEmpty(lc.warn, dl.warn),
+      info: nonEmpty(lc.info, dl.info),
+      debug: nonEmpty(lc.debug, dl.debug),
+      trace: nonEmpty(lc.trace, dl.trace),
+    },
   };
 }
 
@@ -396,14 +481,17 @@ export function validateDebugger(raw: unknown): DebuggerSettingsValid {
     showOnBreakpoint: bool(v.showOnBreakpoint, d.showOnBreakpoint),
     focusAppOnBreakpoint: bool(v.focusAppOnBreakpoint, d.focusAppOnBreakpoint),
     hideOnTermination: bool(v.hideOnTermination, d.hideOnTermination),
+    variablesOnBreakpoint: bool(v.variablesOnBreakpoint, d.variablesOnBreakpoint),
     breakpointsAnyFile: bool(v.breakpointsAnyFile, d.breakpointsAnyFile),
     runToCursorInlay: bool(v.runToCursorInlay, d.runToCursorInlay),
     inlineValues: bool(v.inlineValues, d.inlineValues),
     sortValues: bool(v.sortValues, d.sortValues),
+    liveWatches: bool(v.liveWatches, d.liveWatches),
     valueTooltip: bool(v.valueTooltip, d.valueTooltip),
     valueTooltipOnSelection: bool(v.valueTooltipOnSelection, d.valueTooltipOnSelection),
     valueTooltipDelay: num(v.valueTooltipDelay, d.valueTooltipDelay, WORKFLOW_LIMITS.tooltipDelay, true),
     skipLibraryCode: bool(v.skipLibraryCode, d.skipLibraryCode),
+    debugServerPage: bool(v.debugServerPage, d.debugServerPage),
     python: {
       attachSubprocess: bool(py.attachSubprocess, d.python.attachSubprocess),
       gevent: bool(py.gevent, d.python.gevent),
@@ -419,12 +507,23 @@ export function validateRun(raw: unknown): RunSettingsValid {
     confirmRerun: bool(v.confirmRerun, d.confirmRerun),
     confirmTerminate: bool(v.confirmTerminate, d.confirmTerminate),
     showOnStart: bool(v.showOnStart, d.showOnStart),
+    pinTabs: bool(v.pinTabs, d.pinTabs),
     terminationTimeoutMs: num(
       v.terminationTimeoutMs,
       d.terminationTimeoutMs,
       WORKFLOW_LIMITS.terminationTimeoutMs,
       true,
     ),
+  };
+}
+
+export function validateExternalDiff(raw: unknown): ExternalDiffValid {
+  const d = DEFAULT_WORKFLOW.externalDiff;
+  const v = obj(raw);
+  return {
+    enabled: bool(v.enabled, d.enabled),
+    path: text(v.path, d.path).trim(),
+    parameters: text(v.parameters, d.parameters),
   };
 }
 
@@ -494,6 +593,27 @@ export function validateExternalTools(raw: unknown): ExternalToolValid[] {
   return out;
 }
 
+export function validateAgentSecurity(raw: unknown): AgentSecurityValid {
+  const v = obj(raw);
+  const d = DEFAULT_WORKFLOW.agentSecurity;
+  return {
+    allowedCommands: strings(v.allowedCommands, d.allowedCommands),
+    blockedCommands: strings(v.blockedCommands, d.blockedCommands),
+  };
+}
+
+export const DEFAULT_AGENT_RUNS: AgentRunSettingsValid = { tabLimit: 1, archiveLimit: 999 };
+
+/** From `mcpServer` (Agents › IDE MCP Server). */
+export function validateAgentRuns(raw: unknown): AgentRunSettingsValid {
+  const v = obj(raw);
+  const d = DEFAULT_AGENT_RUNS;
+  return {
+    tabLimit: num(v.agentTabLimit, d.tabLimit, WORKFLOW_LIMITS.agentTabLimit, true),
+    archiveLimit: num(v.agentArchiveLimit, d.archiveLimit, WORKFLOW_LIMITS.agentArchiveLimit, true),
+  };
+}
+
 export function validateWorkflow(raw: unknown): WorkflowSettings {
   const root = obj(raw);
   return {
@@ -504,6 +624,8 @@ export function validateWorkflow(raw: unknown): WorkflowSettings {
     terminal: validateTerminal(root.terminal),
     actionsOnSave: validateActionsOnSave(root.actionsOnSave),
     externalTools: validateExternalTools(root.externalTools),
+    externalDiff: validateExternalDiff(root.externalDiff),
+    agentSecurity: validateAgentSecurity(root.agentSecurity),
     ...validateRemote(root),
   };
 }
@@ -570,3 +692,14 @@ export const EXTERNAL_TOOL_MACROS: ReadonlyArray<{ name: string; description: st
   { name: "$SelectedText$", description: "Text selected in the editor" },
   { name: "$Prompt$", description: "Asks for a value when the tool runs" },
 ];
+
+/** Agents › IDE MCP Server limits on the Run tool window's agent tabs. */
+export function agentRunSettings(): AgentRunSettingsValid {
+  return validateAgentRuns(obj(useProject.getState().settings).mcpServer);
+}
+
+/** React hook over {@link agentRunSettings}. */
+export function useAgentRunSettings(): AgentRunSettingsValid {
+  const raw = useProject((p) => obj(p.settings).mcpServer);
+  return validateAgentRuns(raw);
+}

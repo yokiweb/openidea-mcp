@@ -1,5 +1,5 @@
 import { ContributedToolbar } from "@/workbench/ContributedToolbar";
-import { useFilePresentationIcons } from "@/platform/filePresentation";
+import { useFilePresentationIcons } from "@/ui/filePresentation";
 /**
  * The editor area: split layout of panes, each with IDEA-style tabs (preview
  * tab in italics, pinned tabs, modified dot, file icons coloured by file
@@ -21,7 +21,9 @@ import {
   prepareMenuGroups,
   textEditorWrapperFor,
   EditorShownProvider,
+  EditorTabIdProvider,
   useContributions,
+  useEditorGroupPanels,
   useFileDecorations,
   useEditorDocumentRevision,
   useEditorTabTitles,
@@ -30,6 +32,7 @@ import {
   type EditorKindContribution,
 } from "@/workbench/contributions";
 import { useDistractionFree } from "@/workbench/distractionFree";
+import { useFileColors } from "@/workbench/fileColors";
 import { EmptyEditor } from "@/workbench/EditorArea";
 import {
   EmptyState,
@@ -64,6 +67,7 @@ import { TextEditorHost } from "./TextEditorHost";
 import { FindBar } from "./FindBar";
 import { EditorBanners, VirtualBanner } from "./Banner";
 import { CodeBreadcrumbs } from "./StatusItems";
+import { SideTabsResizer, useSideTabsStyle } from "./SideTabsResizer";
 import styles from "./EditorArea.module.css";
 import { tx } from "@/platform/i18n";
 
@@ -114,7 +118,7 @@ function EmptyEditorArea() {
   return (
     <div ref={ref} className={styles.area}>
       <EmptyEditor />
-      {over && <div className={clsx(styles.dropZone, styles["drop-center"])} aria-hidden="true" />}
+      {over && <div className={styles.dropZone} aria-hidden="true" />}
     </div>
   );
 }
@@ -175,6 +179,7 @@ function PaneView({ paneId }: { paneId: string }) {
   const dirty = tabs.map((tab, i) => inputDirty(tab.input, kinds) ?? textDirty[i] ?? false);
   const colors = useFileDecorations(useShallow(() => paths.map((p) => (p ? (getFileDecoration(p)?.color ?? "") : ""))));
   const tints = useFileDecorations(useShallow(() => paths.map((p) => (p ? (getFileDecoration(p)?.tint ?? "") : ""))));
+  const fileColors = useFileColors("editorTabs");
 
   const hints = useTitleHints();
   const [dropZone, setDropZone] = useState<DropZone | null>(null);
@@ -219,9 +224,13 @@ function PaneView({ paneId }: { paneId: string }) {
           : undefined,
         italic: t.preview,
         modified: dirty[i],
-        closable: showCloseButton,
+        // IDEA: hiding the close button is visual only. Keep close gestures
+        // (middle click, Shift+click, Delete) alive when its position is None.
+        showCloseButton,
         color: colors[i] || undefined,
-        tint: tints[i] || undefined,
+        tint:
+          tints[i] || (fileColors && t.input.kind === "file" && t.input.path ? fileColors(t.input.path) : undefined),
+        tintStrength: tints[i] ? undefined : "var(--file-tint-strength)",
         tooltip: virtualTooltip(t.input) ?? (showFullPathOnHover ? (t.input.path ?? name) : undefined),
         trailing:
           kindMark || pin ? (
@@ -240,6 +249,7 @@ function PaneView({ paneId }: { paneId: string }) {
     dirty,
     colors,
     tints,
+    fileColors,
     hints,
     showExtension,
     markModified,
@@ -252,6 +262,7 @@ function PaneView({ paneId }: { paneId: string }) {
   const pinnedCount = tabs.filter((t) => t.pinned).length;
   // Settings › Editor Tabs › Tab placement Left / Right: a vertical, scrolling column.
   const vertical = tabPrefs.placement === "left" || tabPrefs.placement === "right";
+  const sideTabsStyle = useSideTabsStyle();
   const pinnedRow = tabPrefs.pinnedSeparateRow && pinnedCount > 0 && pinnedCount < tabs.length;
   const dnd = useMemo(() => {
     // A tab released outside the window detaches into a forced new window.
@@ -366,7 +377,9 @@ function PaneView({ paneId }: { paneId: string }) {
         vertical && styles.tabsVertical,
         tabPrefs.placement === "right" && styles.tabsRight,
       )}
+      style={vertical ? sideTabsStyle : undefined}
       data-pane-id={paneId}
+      data-focus-scope=""
       aria-label={tx("Editor")}
       onFocus={onFocus}
       onBlur={onBlur}
@@ -380,24 +393,46 @@ function PaneView({ paneId }: { paneId: string }) {
       ) : (
         strip(items, dnd.all, actions)
       )}
-      <div
-        className={styles.content}
-        role="tabpanel"
-        id={active ? `editor-${paneId}-panel-${active.id}` : undefined}
-        aria-labelledby={active ? `editor-${paneId}-tab-${active.id}` : undefined}
-        ref={contentRef}
-      >
-        {kept.map((tab) => (
-          <KindEditor key={tab.id} tab={tab} shown={tab === active} kept />
-        ))}
-        {!active ? (
-          <EmptyEditor />
-        ) : (
-          !kept.includes(active) && <PaneContent paneId={paneId} tab={active} tabsVisible={!hidden} />
-        )}
-        {dropZone && <div className={clsx(styles.dropZone, styles[`drop-${dropZone}`])} aria-hidden="true" />}
+      {vertical && !hidden && <SideTabsResizer side={tabPrefs.placement === "left" ? "left" : "right"} />}
+      <div className={styles.body}>
+        <div
+          className={styles.content}
+          role="tabpanel"
+          id={active ? `editor-${paneId}-panel-${active.id}` : undefined}
+          aria-labelledby={active ? `editor-${paneId}-tab-${active.id}` : undefined}
+          ref={contentRef}
+        >
+          {kept.map((tab) => (
+            <KindEditor key={tab.id} tab={tab} shown={tab === active} kept />
+          ))}
+          {!active ? (
+            <EmptyEditor />
+          ) : (
+            !kept.includes(active) && <PaneContent paneId={paneId} tab={active} tabsVisible={!hidden} />
+          )}
+          {dropZone && <div className={clsx(styles.dropZone, styles[`drop-${dropZone}`])} aria-hidden="true" />}
+        </div>
+        <GroupPanels paneId={paneId} tabId={active && isTextInput(active.input) ? active.id : null} />
       </div>
     </section>
+  );
+}
+
+/**
+ * The group's contributed panels (plugin minimaps) at its right edge. Mounted once per group,
+ * kept while it switches tabs; hidden while the group shows something other than a text editor.
+ */
+function GroupPanels({ paneId, tabId }: { paneId: string; tabId: string | null }) {
+  const panels = useEditorGroupPanels((s) => s.panels);
+  if (!panels.size) return null;
+  return (
+    <div className={styles.groupPanels} hidden={!tabId}>
+      {[...panels.values()].map((p) => (
+        <div key={p.id} className={styles.groupPanel} style={{ width: p.width }}>
+          <p.component paneId={paneId} tabId={tabId} />
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -472,9 +507,11 @@ function KindEditor({ tab, shown, kept = false }: { tab: Tab; shown: boolean; ke
       tabIndex={-1}
       aria-hidden={shown ? undefined : true}
     >
-      <EditorShownProvider value={shown}>
-        <Component input={tab.input} />
-      </EditorShownProvider>
+      <EditorTabIdProvider value={tab.id}>
+        <EditorShownProvider value={shown}>
+          <Component input={tab.input} />
+        </EditorShownProvider>
+      </EditorTabIdProvider>
     </div>
   );
 }

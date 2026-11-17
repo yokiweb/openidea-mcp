@@ -42,12 +42,33 @@ export interface MybatisEntry {
 
 /** Types MyBatis prints as bare numeric or boolean values. */
 const NUMERIC_TYPES = new Set([
-  "Integer", "Long", "Short", "Byte", "Double", "Float", "BigDecimal", "BigInteger", "int", "long",
-  "short", "byte", "double", "float", "Boolean", "boolean",
+  "Integer",
+  "Long",
+  "Short",
+  "Byte",
+  "Double",
+  "Float",
+  "BigDecimal",
+  "BigInteger",
+  "int",
+  "long",
+  "short",
+  "byte",
+  "double",
+  "float",
+  "Boolean",
+  "boolean",
 ]);
 /** Types MyBatis prints quoted (unknown types fall through to a guess). */
 const TEXTUAL_TYPES = new Set([
-  "String", "Character", "char", "Date", "Timestamp", "Time", "LocalDateTime", "LocalDate",
+  "String",
+  "Character",
+  "char",
+  "Date",
+  "Timestamp",
+  "Time",
+  "LocalDateTime",
+  "LocalDate",
   "LocalTime",
 ]);
 

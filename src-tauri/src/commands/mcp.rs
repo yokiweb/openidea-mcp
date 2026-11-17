@@ -1,9 +1,10 @@
-//! Agents › MCP Server: runs `ide_mcp::McpServer` over the built-in host tools
-//! while it is turned on in Settings, and reports where it listens.
+//! Agents › MCP Server: runs `ide_mcp::McpServer` over built-in host tools
+//! while `mcpServer.enabled` is on, and reports where it listens.
 //!
-//! 与上游的差异（用户 2026-11-10 确认）：开关、端口、token 全部持久化在
-//! `<config_dir>/mcp.json`，server 用固定端口 + 稳定 token 启动。
-//! 上游每次启动随机端口 + 新 token，MCP 客户端的配置重启即失效，必须重新复制。
+//! 与上游的差异（2026-11-17 合并 up/main 后）：固定端口/固定 token 已由上游
+//! 设置体系实现（`mcpServer.fixedPort` / `fixedToken` + `mcp/token` 持久化），
+//! 本地仅保留 `allowWrite`（`execute_query` 的 SQL 写权限开关），持久化在
+//! `<config_dir>/mcp.json`，运行时经 `ide_host::mcp::local::set_allow_write` 生效。
 
 use crate::state::AppState;
 use ide_core::{IdeError, IdeResult, IpcPath};
@@ -11,27 +12,22 @@ use ide_host::mcp::{FileProblems, FocusedEditor};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{State, Window};
 
-/// 首次使用的端口；之后可在设置页改。
-const DEFAULT_PORT: u16 = 41521;
-
-/// `<config_dir>/mcp.json`：本页唯一的真源（不再读全局设置里的 mcpServer.enabled，
-/// 避免设置页与配置文件两处状态打架）。
-#[derive(Clone, Serialize, Deserialize)]
+/// `<config_dir>/mcp.json`：只存本地增量 `allowWrite`；
+/// 开关/地址/端口/token 走上游全局设置（`mcpServer.*`）。
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Config {
-    enabled: bool,
-    port: u16,
     allow_write: bool,
-    token: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { enabled: false, port: DEFAULT_PORT, allow_write: false, token: ide_mcp::new_token().unwrap_or_default() }
+        Self { allow_write: false }
     }
 }
 
@@ -39,194 +35,214 @@ fn config_path(state: &AppState) -> PathBuf {
     state.host.config_dir.join("mcp.json")
 }
 
-/// 读配置。空 token / 0 端口视为损坏（手改或旧文件），补默认值并写回，
-/// 否则客户端会拿到空凭据。
-fn load(state: &AppState) -> Config {
-    let path = config_path(state);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Config::default();
-    };
-    let mut config: Config = serde_json::from_str(&text).unwrap_or_else(|e| {
-        tracing::warn!("mcp.json is malformed, using the defaults: {e}");
-        Config::default()
-    });
-    let mut repaired = false;
-    if config.token.is_empty() {
-        config.token = ide_mcp::new_token().unwrap_or_default();
-        repaired = true;
-    }
-    if config.port == 0 {
-        config.port = DEFAULT_PORT;
-        repaired = true;
-    }
-    if repaired {
-        let _ = save(state, &config);
-    }
-    config
+/// 读 `mcp.json`。文件缺失或损坏视为 `false`（与守卫默认拒绝一致）。
+fn load_allow_write(state: &AppState) -> bool {
+    std::fs::read_to_string(config_path(state))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Config>(&text).ok())
+        .map(|c| c.allow_write)
+        .unwrap_or(false)
 }
 
-fn save(state: &AppState, config: &Config) -> IdeResult<()> {
+fn save_allow_write(state: &AppState, allow: bool) -> IdeResult<()> {
     let path = config_path(state);
-    let text = serde_json::to_string_pretty(config).map_err(|e| IdeError::internal(e.to_string()))?;
+    let text =
+        serde_json::to_string_pretty(&Config { allow_write: allow }).map_err(|e| IdeError::internal(e.to_string()))?;
     std::fs::write(&path, text).map_err(|e| IdeError::internal(format!("cannot write {}: {e}", path.display())))
-}
-
-/// 正在运行的 server 及其绑定参数（端口/写权限变了要重启）。
-struct Running {
-    server: ide_mcp::McpServer,
-    port: u16,
-    allow_write: bool,
 }
 
 /// The server while it runs, or why it doesn't.
 #[derive(Default)]
 pub struct McpService {
-    running: Mutex<Option<Running>>,
+    server: Mutex<Option<ide_mcp::McpServer>>,
+    /// The port and token settings the running server was started with.
+    running_with: Mutex<Option<Listen>>,
     error: Mutex<Option<String>>,
 }
 
-fn stop_running(service: &McpService) {
-    if let Some(running) = service.running.lock().take() {
-        running.server.stop();
-    }
+/// What the address, port and token settings ask the server for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Listen {
+    /// `mcpServer.address`.
+    address: IpAddr,
+    /// `mcpServer.port` with `mcpServer.fixedPort`; otherwise a free port.
+    port: Option<u16>,
+    fixed_token: bool,
 }
 
-/// 启动（或按新配置重启）server。
-fn start(state: &AppState, config: &Config) {
-    let mut running = state.mcp.running.lock();
-    if let Some(current) = running.as_ref() {
-        // 端口与写权限没变就不重来（重启会断掉客户端连接）。
-        if current.port == config.port && current.allow_write == config.allow_write {
-            return;
+/// Starts, stops or restarts the server to match the global `mcpServer` settings: `enabled`,
+/// and the address, port and token it listens with.
+pub fn apply(state: &AppState) {
+    // 本地增量：写权限开关随 apply 同步（原子量，运行时即时生效，无需重启）。
+    ide_host::mcp::local::set_allow_write(load_allow_write(state));
+    let settings = state.global_settings.effective().mcp_server;
+    let mut server = state.mcp.server.lock();
+    if !settings.enabled {
+        if let Some(running) = server.take() {
+            running.stop();
+        }
+        *state.mcp.running_with.lock() = None;
+        ide_agent::set_mcp_executable(None);
+        state.host.set_mcp_executable(None);
+        *state.mcp.error.lock() = None;
+        return;
+    }
+    let Ok(address) = settings.address.trim().parse::<IpAddr>() else {
+        if let Some(running) = server.take() {
+            running.stop();
+        }
+        *state.mcp.running_with.lock() = None;
+        *state.mcp.error.lock() =
+            Some(format!("the listen address `{}` is not an IP address", settings.address.trim()));
+        return;
+    };
+    let wanted = Listen {
+        address,
+        port: settings.fixed_port.then_some(settings.port).filter(|p| *p != 0),
+        fixed_token: settings.fixed_token,
+    };
+    if server.is_some() && *state.mcp.running_with.lock() == Some(wanted) {
+        return;
+    }
+    // Another address, port or token: clients connect anew.
+    if let Some(running) = server.take() {
+        let held = (running.address(), running.port());
+        running.stop();
+        if let Some(port) = port_to_wait_for(held, wanted.port) {
+            wait_until_free(address, port);
         }
     }
-    if let Some(previous) = running.take() {
-        previous.server.stop();
-    }
-    ide_host::mcp::local::set_allow_write(config.allow_write);
+    let token = if wanted.fixed_token {
+        match ide_mcp::kept_token(&ide_mcp::token_path(&state.data_dir)) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                tracing::warn!("MCP server: cannot keep the token ({e}); using a new one for this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let discovery = ide_mcp::discovery_path(&state.data_dir);
     match ide_mcp::McpServer::start_with(
         Arc::new(ide_host::mcp::Registry::new(state.host.clone())),
         Some(discovery),
         &state.host.runtime,
-        Some(config.port),
-        Some(config.token.clone()),
+        ide_mcp::ServerOptions { address: Some(address), port: wanted.port, token },
     ) {
         Ok(started) => {
             let exe = std::env::current_exe().unwrap_or_default();
             state.host.set_mcp_executable(Some(exe.clone()));
             ide_agent::set_mcp_executable(Some(exe));
-            *running = Some(Running { server: started, port: config.port, allow_write: config.allow_write });
+            *server = Some(started);
+            *state.mcp.running_with.lock() = Some(wanted);
             *state.mcp.error.lock() = None;
         }
         Err(e) => {
             tracing::warn!("MCP server: {e}");
+            *state.mcp.running_with.lock() = None;
             *state.mcp.error.lock() = Some(e.to_string());
         }
     }
 }
 
-/// Starts or stops the server to match `mcp.json`.
-/// 调用点：lib.rs 启动、设置变更、命令层 apply。
-pub fn apply(state: &AppState) {
-    let config = load(state);
-    if !config.enabled {
-        stop_running(&state.mcp);
-        state.host.set_mcp_executable(None);
-        ide_agent::set_mcp_executable(None);
-        *state.mcp.error.lock() = None;
-        return;
+/// The port a restart listening on `wanted` waits for after stopping the server that listened
+/// on `held`: only its own, at any address (`127.0.0.1` and `0.0.0.0` overlap). A port another
+/// program holds (the run fell back to a free one) stays taken, and waiting for it would block
+/// the window.
+fn port_to_wait_for(held: (IpAddr, u16), wanted: Option<u16>) -> Option<u16> {
+    wanted.filter(|port| held.1 == *port)
+}
+
+/// Waits briefly for a stopped server's port to close, so the restart gets it again.
+fn wait_until_free(address: IpAddr, port: u16) {
+    for _ in 0..100 {
+        if std::net::TcpListener::bind((address, port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    start(state, &config);
 }
 
 /// Stops the server on exit (its discovery file goes with it).
 pub fn stop(state: &AppState) {
     state.host.set_mcp_executable(None);
     ide_agent::set_mcp_executable(None);
-    stop_running(&state.mcp);
+    if let Some(server) = state.mcp.server.lock().take() {
+        server.stop();
+    }
+    *state.mcp.running_with.lock() = None;
 }
 
 /// What Settings › Agents › MCP Server shows.
 #[derive(Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerStatus {
-    /// 保存的开关（`mcp.json`）。
-    pub enabled: bool,
     pub running: bool,
     /// Why it isn't running though turned on.
     pub error: Option<String>,
-    pub port: u16,
+    /// The address listened on (`0.0.0.0` / `::`: every address).
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    /// Why the fixed port (`mcpServer.port`) isn't the one listened on: it was in use or
+    /// reserved, so a free port was taken for this run.
+    pub port_unavailable: Option<String>,
+    /// 本地增量：`execute_query` 的 SQL 写权限开关（`mcp.json`）。
     pub allow_write: bool,
-    /// Bearer token MCP clients send; stable across restarts.
-    pub token: String,
     /// The window's local project, which the URL and command below are for.
     pub project: Option<IpcPath>,
-    /// `http://127.0.0.1:<port>/mcp?project=<root>`.
+    /// `http://<address>:<port>/mcp?project=<root>`, with loopback for every address.
     pub url: Option<String>,
+    /// Bearer token of `url` (changes with every run unless `mcpServer.fixedToken` is on).
+    pub token: Option<String>,
     /// The stdio bridge: this executable and its arguments.
     pub stdio_command: Vec<String>,
-}
-
-fn status(state: &AppState, window: &str) -> McpServerStatus {
-    let config = load(state);
-    let running = state.mcp.running.lock();
-    let root: Option<PathBuf> = state.host.project(window).ok().map(|p| p.root.clone());
-    let exe = std::env::current_exe().unwrap_or_default();
-    McpServerStatus {
-        enabled: config.enabled,
-        running: running.is_some(),
-        error: state.mcp.error.lock().clone(),
-        port: running.as_ref().map_or(config.port, |r| r.port),
-        allow_write: running.as_ref().map_or(config.allow_write, |r| r.allow_write),
-        token: config.token.clone(),
-        url: root.as_ref().map(|r| ide_mcp::endpoint_url(config.port, r)),
-        stdio_command: root.as_ref().map(|r| ide_mcp::stdio_command(&exe, r)).unwrap_or_default(),
-        project: root.map(IpcPath::from),
-    }
-}
-
-/// 失败也返回 Ok(status)：设置页保留用户填的值，错误显示在状态行，
-/// 而不是整页退回 fallback（会把「没有打开项目」误显示成「构建太旧」）。
-fn soft_fail(state: &AppState, window: &str, message: String) -> IdeResult<McpServerStatus> {
-    *state.mcp.error.lock() = Some(message);
-    Ok(status(state, window))
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn mcp_server_status(window: Window, state: State<'_, AppState>) -> IdeResult<McpServerStatus> {
-    // 设置页可能开在独立的 settings 窗口，映射回它所属的项目窗口。
+    // 设置页可能开在独立的 settings 窗口，映射回它所属的项目窗口（无项目时 root 为空）。
     let label = AppState::owner_window(window.label()).to_owned();
-    Ok(status(&state, &label))
+    let root: Option<PathBuf> = state.project(&label).ok().map(|p| p.root.clone());
+    let server = state.mcp.server.lock();
+    let exe = std::env::current_exe().unwrap_or_default();
+    Ok(McpServerStatus {
+        running: server.is_some(),
+        error: state.mcp.error.lock().clone(),
+        address: server.as_ref().map(|s| s.address().to_string()),
+        port: server.as_ref().map(|s| s.port()),
+        port_unavailable: server.as_ref().and_then(|s| s.port_unavailable().map(str::to_owned)),
+        allow_write: load_allow_write(&state),
+        url: server.as_ref().zip(root.as_ref()).map(|(s, r)| s.url(r)),
+        token: server.as_ref().map(|s| s.token().to_owned()),
+        stdio_command: root.as_ref().map(|r| ide_mcp::stdio_command(&exe, r)).unwrap_or_default(),
+        project: root.map(IpcPath::from),
+    })
 }
 
-/// Saves `enabled` / `port` / `allow_write` and applies them: starts the
-/// server, restarts it when the address changed, or stops it.
+/// 设置页 › allowWrite：持久化到 `mcp.json` 并即时生效（原子量，无需重启 server）。
 #[tauri::command]
 #[specta::specta]
-pub async fn mcp_server_apply(
-    window: Window,
-    state: State<'_, AppState>,
-    enabled: bool,
-    port: u16,
-    allow_write: bool,
-) -> IdeResult<McpServerStatus> {
-    let label = AppState::owner_window(window.label()).to_owned();
-    let mut config = load(&state);
-    config.enabled = enabled;
-    config.port = port;
-    config.allow_write = allow_write;
-    if let Err(e) = save(&state, &config) {
-        return soft_fail(&state, &label, e.message);
+pub fn mcp_server_set_allow_write(state: State<'_, AppState>, allow: bool) -> IdeResult<()> {
+    save_allow_write(&state, allow)?;
+    ide_host::mcp::local::set_allow_write(allow);
+    Ok(())
+}
+
+/// Settings › Agents › MCP Server › Regenerate Token: forgets the kept token, and restarts the
+/// server with a new one. Clients configured with the old token stop working.
+#[tauri::command]
+#[specta::specta]
+pub fn mcp_regenerate_token(state: State<'_, AppState>) -> IdeResult<()> {
+    match std::fs::remove_file(ide_mcp::token_path(&state.data_dir)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
-    if enabled {
-        if let Err(e) = state.host.require_trust(&label) {
-            return soft_fail(&state, &label, e.message);
-        }
-    }
+    *state.mcp.running_with.lock() = None;
     apply(&state);
-    Ok(status(&state, &label))
+    Ok(())
 }
 
 #[tauri::command]
@@ -271,6 +287,15 @@ pub fn mcp_ui_ready(window: Window, state: State<'_, AppState>, ready: bool) -> 
     Ok(())
 }
 
+/// The user closed the Run tool window tab of an agent command (`run_command`).
+#[tauri::command]
+#[specta::specta]
+pub fn mcp_agent_run_closed(window: Window, state: State<'_, AppState>, name: String) -> IdeResult<()> {
+    let project = state.project(window.label())?;
+    state.host.mcp_agent_runs.closed(&project.root, &name);
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn mcp_respond(
@@ -281,4 +306,22 @@ pub fn mcp_respond(
     error: Option<String>,
 ) -> IdeResult<()> {
     state.host.mcp_requests.answer(window.label(), id, allow, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn a_restart_waits_only_for_the_port_the_stopped_server_held() {
+        let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(port_to_wait_for((local, 64342), Some(64342)), Some(64342));
+        // Another address on the same port overlaps the old listener: wait for it too.
+        assert_eq!(port_to_wait_for((any, 64342), Some(64342)), Some(64342));
+        // The fixed port was taken by another program: the server ran on a free one.
+        assert_eq!(port_to_wait_for((local, 51234), Some(64342)), None);
+        assert_eq!(port_to_wait_for((local, 64342), None), None);
+    }
 }
