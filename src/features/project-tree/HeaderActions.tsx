@@ -1,20 +1,36 @@
 import { shortcutLabel } from "@/platform/keymap";
 import { IconButton, type MenuItem } from "@/ui";
-import { VIEW_MODES, setViewMode, setViewOption, useProjectTree, type ViewOptions } from "./store";
+import { useProject } from "@/platform/project";
+import { userScopes } from "@/platform/scopes";
+import { VIEW_MODES, setScopeView, setViewMode, setViewOption, useProjectTree, type ViewOptions } from "./store";
 import type { SortKey } from "./model";
 
 /** The title's "Project ▾" pane switcher (IDEA: Project / Project Files / Open Files / …). */
 export function useProjectTitleMenu(): { label: string; items: MenuItem[] } {
   const mode = useProjectTree((s) => s.mode);
+  const scope = useProjectTree((s) => s.scope);
   const unity = useProjectTree((s) => s.unity);
+  // User scopes (Settings › Scopes) follow the built-in panes, as in IDEA.
+  const scopes = userScopes(useProject((s) => (s.settings as { scopes?: unknown } | null)?.scopes));
+  const items: MenuItem[] = VIEW_MODES.filter(([id]) => id !== "unity" || unity).map(([id, label]) => ({
+    id,
+    label,
+    checked: id === mode,
+    run: () => setViewMode(id),
+  }));
+  if (scopes.length) {
+    items.push({ kind: "separator" });
+    for (const s of scopes)
+      items.push({
+        id: `scope:${s.name}`,
+        label: s.name,
+        checked: mode === "scope" && scope === s.name,
+        run: () => setScopeView(s.name),
+      });
+  }
   return {
-    label: VIEW_MODES.find(([id]) => id === mode)?.[1] ?? "Project",
-    items: VIEW_MODES.filter(([id]) => id !== "unity" || unity).map(([id, label]) => ({
-      id,
-      label,
-      checked: id === mode,
-      run: () => setViewMode(id),
-    })),
+    label: mode === "scope" ? (scope ?? "Project") : (VIEW_MODES.find(([id]) => id === mode)?.[1] ?? "Project"),
+    items,
   };
 }
 
@@ -23,13 +39,18 @@ export type ToggleOption = {
   [K in keyof ViewOptions]-?: ViewOptions[K] extends boolean ? K : never;
 }[keyof ViewOptions];
 
-export const OPTION_LABELS: Array<[ToggleOption, string]> = [
+const APPEARANCE_OPTIONS: Array<[ToggleOption, string]> = [
   ["showHidden", "Show Hidden Files"],
   ["showExcluded", "Show Excluded Files"],
   ["showMembers", "Show Members"],
   ["showRootPaths", "Show Root Paths"],
+  ["horizontalScroll", "Horizontal Scrolling"],
   ["compact", "Compact Middle Packages"],
-  ["foldersFirst", "Sort Folders First"],
+];
+
+const FOLDERS_FIRST: [ToggleOption, string] = ["foldersFirst", "Sort Folders First"];
+
+const BEHAVIOR_OPTIONS: Array<[ToggleOption, string]> = [
   ["autoscrollFromSource", "Always Select Opened File"],
   ["autoscrollToSource", "Autoscroll to Source"],
   ["singleClickOpen", "Open Files with Single Click"],
@@ -37,8 +58,7 @@ export const OPTION_LABELS: Array<[ToggleOption, string]> = [
   ["previewTab", "Enable Preview Tab"],
 ];
 
-/** The first entries of OPTION_LABELS are Appearance options, the rest Behavior. */
-const APPEARANCE_OPTIONS = 6;
+export const OPTION_LABELS = [...APPEARANCE_OPTIONS, FOLDERS_FIRST, ...BEHAVIOR_OPTIONS];
 
 /** Header controls of the Project tool window (IDEA: Locate, Expand/Collapse All). */
 export function ProjectHeaderActions() {
@@ -61,35 +81,46 @@ export function ProjectHeaderActions() {
   );
 }
 
-export const SORT_LABELS: Array<[SortKey, string]> = [
-  ["name", "Sort by Name"],
-  ["type", "Sort by Type"],
-  ["modified", "Sort by Modification Time"],
+export const SORT_LABELS: Array<[key: SortKey, actionLabel: string, menuLabel: string]> = [
+  ["name", "Sort by Name", "Name"],
+  ["type", "Sort by Type", "Type"],
+  ["modified", "Sort by Modification Time", "Modification Time"],
 ];
 
-/** View options in the header's "⋮" menu (IDEA: Project › Options › Appearance / Behavior). */
+/** Project view options in the header's "⋮" menu. */
 export function useProjectHeaderMenu(): MenuItem[] {
   const options = useProjectTree((s) => s.options);
   const unity = useProjectTree((s) => s.mode === "unity");
   return [
-    { kind: "header", label: "Appearance" },
-    ...(unity
-      ? [
-          option("showUnityMeta", "Show Meta Files", options),
-          option("showUnityGenerated", "Show Generated Files", options),
-        ]
-      : []),
-    ...OPTION_LABELS.slice(0, APPEARANCE_OPTIONS).map(([key, label]) => option(key, label, options)),
-    { kind: "separator" },
-    ...SORT_LABELS.map(([sortBy, label]): MenuItem => ({
-      id: `sort.${sortBy}`,
-      label,
-      checked: options.sortBy === sortBy,
-      run: () => setViewOption("sortBy", sortBy),
-    })),
-    { kind: "separator" },
-    { kind: "header", label: "Behavior" },
-    ...OPTION_LABELS.slice(APPEARANCE_OPTIONS).map(([key, label]) => option(key, label, options)),
+    {
+      label: "Behavior",
+      submenu: BEHAVIOR_OPTIONS.map(([key, label]) => option(key, label, options)),
+    },
+    {
+      label: "Appearance",
+      submenu: [
+        ...(unity
+          ? [
+              option("showUnityMeta", "Show Meta Files", options),
+              option("showUnityGenerated", "Show Generated Files", options),
+            ]
+          : []),
+        ...APPEARANCE_OPTIONS.map(([key, label]) => option(key, label, options)),
+      ],
+    },
+    {
+      label: "Sort By",
+      submenu: [
+        ...SORT_LABELS.map(([sortBy, , label]): MenuItem => ({
+          id: `sort.${sortBy}`,
+          label,
+          checked: options.sortBy === sortBy,
+          run: () => setViewOption("sortBy", sortBy),
+        })),
+        { kind: "separator" },
+        option(...FOLDERS_FIRST, options),
+      ],
+    },
   ];
 }
 

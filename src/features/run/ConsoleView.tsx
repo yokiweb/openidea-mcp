@@ -20,6 +20,8 @@ import { Icon, showContextMenu } from "@/ui";
 import { spanStyle, type Span, type SpanStyle } from "@/ui/ansi";
 import ansi from "@/ui/ansi.module.css";
 import { logLineColor } from "@/ui/logColors";
+import { compileConsoleRules, matchConsoleRules, styleSpans, type ConsoleRuleMatch } from "@/ui/consoleRules";
+import { useConsoleRules } from "@/workbench/contributions";
 import type { ConsoleLine, ConsoleModel } from "./console";
 import { findOutputLinks, type OutputLink } from "./links";
 import { parseMybatisLog } from "./mybatis";
@@ -32,6 +34,7 @@ import { useConsoleSelection } from "./useConsoleSelection";
 import { hostBinding, formatBinding, hasPrimaryModifier, registerKeyClaim } from "@/platform/keymap";
 import { WidestColumns } from "@/platform/consoleColumns";
 import { tx } from "@/platform/i18n";
+import { executeAction } from "@/platform/actions";
 import { ConsoleFindBar } from "@/ui/ConsoleFindBar";
 import { DEFAULT_FIND_OPTIONS, findInLines, type FindOptions } from "@/ui/consoleFind";
 
@@ -82,20 +85,25 @@ const Line = memo(
   function Line({
     line,
     marks,
+    rules,
     cwd,
     mark,
     onMybatis,
   }: {
     line: ConsoleLine;
     marks?: readonly SegmentMark[];
+    rules?: ConsoleRuleMatch;
     length: number;
     cwd: string;
     mark?: MybatisMark;
     onMybatis: (entryId: number, at: MouseEvent) => void;
   }) {
     // Not memoised: the open (last) line mutates in place; `memo` below re-renders on length changes only.
+    // 两层着色：本地 MyBatis SQL token 着色在前，上游 consoleRules 规则着色在后。
+    const base = spansOf(line, mark);
+    const spans = rules ? styleSpans(base, rules) : base;
     const links = line.kind === "system" ? [] : withMybatisLink(findOutputLinks(line.text), mark, line.text.length);
-    const segments = segmentLine(spansOf(line, mark), links, marks);
+    const segments = segmentLine(spans, links, marks);
     const activate = (e: MouseEvent, link: OutputLink) => {
       e.preventDefault();
       if (window.getSelection()?.toString()) return;
@@ -149,7 +157,8 @@ const Line = memo(
     a.cwd === b.cwd &&
     a.marks === b.marks &&
     a.mark === b.mark &&
-    a.onMybatis === b.onMybatis,
+    a.onMybatis === b.onMybatis &&
+    a.rules === b.rules,
 );
 
 /** A run of folded lines (Settings › Console › Fold lines that contain). */
@@ -166,6 +175,15 @@ export interface Fold {
  * the `<N internal lines>` placeholder to the previous line), or a fold with no line before it.
  */
 export type DisplayRow = { kind: "line"; index: number; fold?: Fold } | { kind: "fold"; fold: Fold };
+
+/**
+ * IDEA's Fold Lines Like This: the selection when it stays on one line, else the clicked line;
+ * trimmed, and `null` when that leaves nothing to fold on.
+ */
+export function foldLineText(selection: string, line: string | null): string | null {
+  const text = (selection || (line ?? "")).trim();
+  return text && !/[\r\n]/.test(text) ? text : null;
+}
 
 /**
  * Folds runs of consecutive output lines (one or more) that contain one of
@@ -185,7 +203,10 @@ export function foldRows(
       const fold: Fold = { start: i, count: j - i, id: lines[i]!.id, expanded: expanded.has(lines[i]!.id) };
       const prev = rows[rows.length - 1];
       if (prev?.kind === "line") prev.fold = fold;
-      else if (!fold.expanded) rows.push({ kind: "fold", fold });
+      else if (fold.expanded) {
+        rows.push({ kind: "line", index: i, fold });
+        i++;
+      } else rows.push({ kind: "fold", fold });
       if (fold.expanded) for (; i < j; i++) rows.push({ kind: "line", index: i });
       i = j;
       continue;
@@ -251,6 +272,7 @@ export function ConsoleView({
     if (entry) void openMybatisSql(entry.sql, at);
   }, []);
   const logColors = useWorkflowSettings((s) => s.console.logColors);
+  const consoleRules = compileConsoleRules(useConsoleRules((s) => s.providers));
   // The Run console uses Tools › Terminal › Font (which can follow Editor › Font),
   // so the font and fallback configured there apply to process output too.
   const consoleFont = useConsoleFont();
@@ -280,7 +302,7 @@ export function ConsoleView({
   // Pending input continues the open line (a prompt), or starts a row of its own.
   const lastRow = folded[folded.length - 1];
   const inputInline =
-    !!input && !!model.openLine && lastRow?.kind === "line" && !lastRow.fold && lines[lastRow.index] === model.openLine;
+    !!input && !!model.openLine && lastRow?.kind === "line" && lines[lastRow.index] === model.openLine;
   const inputRow = !!input && !inputInline;
   const [widest] = useState(() => new WidestColumns());
   // eslint-disable-next-line react-hooks/exhaustive-deps -- `version` marks in-place appends to `lines`
@@ -305,7 +327,7 @@ export function ConsoleView({
     getItemKey: (i) => {
       const r = rows[i];
       if (!r) return "input";
-      return r.kind === "fold" ? `f${r.fold.id}` : (lines[r.index]?.id ?? i);
+      return r.kind === "fold" ? r.fold.id : (lines[r.index]?.id ?? i);
     },
   });
 
@@ -481,11 +503,20 @@ export function ConsoleView({
   /** The selected text; after Select All the whole buffer, including rows that are not mounted. */
   const selectedOutput = () => (allSelected() ? model.text() : (window.getSelection()?.toString() ?? ""));
 
+  /** The output line a context menu opened on; folds and the input row have none. */
+  const lineAt = (target: EventTarget) => {
+    const index = (target as Element).closest?.("[data-index]")?.getAttribute("data-index");
+    const row = index == null ? undefined : rows[Number(index)];
+    const line = row?.kind === "line" ? lines[row.index] : undefined;
+    return line && line.kind !== "system" ? line.text : null;
+  };
+
   const onContextMenu = (e: MouseEvent) => {
     e.preventDefault();
     const selection = selectedOutput();
     // Selected MyBatis log (Preparing:/Parameters:) copies back as executable SQL.
     const restored = selection ? parseMybatisLog([{ id: 0, text: selection }]) : [];
+    const foldText = foldLineText(selection, lineAt(e.target));
     showContextMenu(e, [
       {
         label: "Copy",
@@ -515,6 +546,12 @@ export function ConsoleView({
         run: openFind,
       },
       { kind: "separator" },
+      {
+        label: "Fold Lines Like This",
+        disabled: !foldText,
+        // Opens Settings › Console with the text added to the fold patterns, for OK / Cancel there.
+        run: () => void executeAction("file.settings", `build.console#${foldText}`),
+      },
       { label: "Clear All", icon: "trash", disabled: !onClear, run: () => onClear?.() },
       ...(input
         ? [{ kind: "separator" } as const, { label: "Send EOF", shortcut: "⌃D", run: () => input.onEof() }]
@@ -535,7 +572,7 @@ export function ConsoleView({
       return;
     }
     if (copySelectionOnKeyDown(e, selectedOutput)) return;
-    if (!input) return;
+    if (!input || e.target instanceof HTMLButtonElement) return;
     if (e.key === "d" && e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       input.onEof();
@@ -572,19 +609,24 @@ export function ConsoleView({
   const foldButton = (fold: Fold, attached: boolean) =>
     fold.expanded ? (
       <button
+        key={fold.id}
         type="button"
         className={styles.foldToggle}
+        style={{ height: rowHeight }}
         title={tx("Collapse folded lines")}
         aria-label={tx("Collapse folded lines")}
+        aria-expanded={true}
         onClick={() => toggleFold(fold.id)}
       >
-        <Icon name="chevron-up" size={10} />
+        <Icon name="chevron-down" size={10} />
       </button>
     ) : (
       <button
+        key={fold.id}
         type="button"
         className={styles.fold}
         title={tx("Expand folded lines")}
+        aria-expanded={false}
         onClick={() => toggleFold(fold.id)}
       >
         {`${attached ? " " : ""}${fold.count === 1 ? tx`<${fold.count} internal line>` : tx`<${fold.count} internal lines>`}`}
@@ -688,25 +730,29 @@ export function ConsoleView({
             }
             const line = lines[row.index];
             if (!line) return null;
-            // The level colour is the inherited fallback; spans with their own ANSI colour win.
-            const color = logLineColor(line.text, line.kind, logColors);
+            // A plugin's whole-line rule replaces the level colour. The level colour is the
+            // inherited fallback; spans with their own ANSI colour win (rule styles replace those).
+            const ruled = matchConsoleRules(line.text, line.kind, consoleRules);
+            const color = ruled?.line ? ruled.line.fg : logLineColor(line.text, line.kind, logColors);
             return (
               <div
                 key={item.key}
                 data-index={item.index}
                 ref={softWrap ? virtualizer.measureElement : undefined}
                 className={clsx(styles.line, styles[line.kind])}
-                style={{ ...rowStyle(item.start), color }}
+                style={{ ...rowStyle(item.start), color, background: ruled?.line?.bg }}
               >
+                {row.fold?.expanded && foldButton(row.fold, false)}
                 <Line
                   line={line}
                   marks={marksByLine.get(row.index)}
+                  rules={ruled}
                   length={line.text.length}
                   cwd={cwd}
                   mark={statements.mark(line.id)}
                   onMybatis={restoreSql}
                 />
-                {row.fold && foldButton(row.fold, true)}
+                {row.fold && !row.fold.expanded && foldButton(row.fold, true)}
                 {inputInline && item.index === rows.length - 1 && pendingInput}
                 {"\n"}
               </div>

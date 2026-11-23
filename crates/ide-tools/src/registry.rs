@@ -201,6 +201,18 @@ pub static TOOLS: &[ToolSpec] = &[
         needs: NODE,
         homepage: "https://oxc.rs/docs/guide/usage/linter",
     },
+    // Linter and formatter: `biome lsp-proxy` lints, and Reformat Code runs `biome format`.
+    ToolSpec {
+        name: "biome",
+        display: "Biome",
+        kind: LanguageServer,
+        commands: &["biome"],
+        method: Method::Npm { packages: &["@biomejs/biome"] },
+        fallback: None,
+        version: ver("biome"),
+        needs: NODE,
+        homepage: "https://biomejs.dev",
+    },
     ToolSpec {
         name: "eslint",
         display: "ESLint Language Server",
@@ -210,6 +222,17 @@ pub static TOOLS: &[ToolSpec] = &[
         fallback: None,
         version: V,
         homepage: "https://github.com/hrsh7th/vscode-langservers-extracted",
+        needs: NODE,
+    },
+    ToolSpec {
+        name: "stylelint",
+        display: "Stylelint Language Server",
+        kind: LanguageServer,
+        commands: &["stylelint-language-server"],
+        method: Method::Npm { packages: &["@stylelint/language-server"] },
+        fallback: None,
+        version: V,
+        homepage: "https://github.com/stylelint/vscode-stylelint",
         needs: NODE,
     },
     ToolSpec {
@@ -443,6 +466,18 @@ pub static TOOLS: &[ToolSpec] = &[
         version: V,
         homepage: "https://angular.dev/tools/language-service",
         needs: &[],
+    },
+    ToolSpec {
+        name: "tailwindcss-language-server",
+        display: "Tailwind CSS Language Server",
+        kind: LanguageServer,
+        commands: &["tailwindcss-language-server"],
+        // Brings Tailwind CSS 3 and 4 for projects whose own `tailwindcss` isn't installed yet.
+        method: Method::Npm { packages: &["@tailwindcss/language-server"] },
+        fallback: None,
+        version: V,
+        homepage: "https://github.com/tailwindlabs/tailwindcss-intellisense",
+        needs: NODE,
     },
     ToolSpec {
         name: "graphql-lsp",
@@ -794,6 +829,28 @@ pub static TOOLS: &[ToolSpec] = &[
         needs: &[],
     },
     ToolSpec {
+        name: "java-analyzer",
+        display: "java-analyzer",
+        kind: LanguageServer,
+        commands: &["java-analyzer"],
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "l0ng-ai/java-analyzer" },
+            assets: &[
+                rule(Mac, Arm64, "java-analyzer-macos-aarch64.gz"),
+                rule(Mac, X64, "java-analyzer-macos-x86_64.gz"),
+                rule(Linux, Arm64, "java-analyzer-linux-aarch64.gz"),
+                rule(Linux, X64, "java-analyzer-linux-x86_64.gz"),
+                rule(Windows, Arm64, "java-analyzer-windows-aarch64.zip"),
+                rule(Windows, X64, "java-analyzer-windows-x86_64.zip"),
+            ],
+            locate: &["java-analyzer"],
+        },
+        fallback: None,
+        version: ver("java-analyzer"),
+        homepage: "https://github.com/l0ng-ai/java-analyzer",
+        needs: &[],
+    },
+    ToolSpec {
         name: "kmp-lsp",
         display: "kmp-lsp",
         kind: LanguageServer,
@@ -990,6 +1047,28 @@ pub static TOOLS: &[ToolSpec] = &[
         fallback: None,
         version: ver("texlab"),
         homepage: "https://github.com/latex-lsp/texlab",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "tinymist",
+        display: "Tinymist (Typst)",
+        kind: LanguageServer,
+        commands: &["tinymist"],
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "Myriad-Dreamin/tinymist" },
+            assets: &[
+                rule(Mac, Arm64, "tinymist-aarch64-apple-darwin.tar.gz"),
+                rule(Mac, X64, "tinymist-x86_64-apple-darwin.tar.gz"),
+                rule(Linux, X64, "tinymist-x86_64-unknown-linux-gnu.tar.gz"),
+                rule(Linux, Arm64, "tinymist-aarch64-unknown-linux-gnu.tar.gz"),
+                rule(Windows, X64, "tinymist-x86_64-pc-windows-msvc.zip"),
+                rule(Windows, Arm64, "tinymist-aarch64-pc-windows-msvc.zip"),
+            ],
+            locate: &["tinymist"],
+        },
+        fallback: None,
+        version: ver("tinymist"),
+        homepage: "https://myriad-dreamin.github.io/tinymist/",
         needs: &[],
     },
     ToolSpec {
@@ -1242,7 +1321,7 @@ mod tests {
                 known.insert((d.adapter.clone(), d.command.clone()));
             }
         }
-        // The host selects the formatter of each file (Prettier or oxfmt) and runs its own CLIs.
+        // The host selects the formatter of each file (Prettier, oxfmt or Biome) and runs its own CLIs.
         for t in TOOLS.iter().filter(|t| !matches!(t.kind, Plugin | Formatter | Cli)) {
             assert!(
                 known.contains(&(t.name.to_string(), t.commands[0].to_string())),

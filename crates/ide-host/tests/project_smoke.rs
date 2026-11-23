@@ -110,7 +110,7 @@ async fn smoke(f: Fixture) {
     })
     .await;
 
-    let roots = ops::project::roots(&p.host, WINDOW).unwrap().roots;
+    let roots = ops::project::project_roots(&p.host, WINDOW).unwrap().roots;
     for (path, kind) in f.roots {
         assert!(
             roots.iter().any(|r| r.path == *path && r.kind == *kind),
@@ -351,7 +351,7 @@ async fn python_venv() {
     // The project's virtualenv: listed first, and the interpreter the project uses.
     let found = ops::sdk::sdk_detect(&p.host, WINDOW, ide_sdk::SdkKind::Python).await.unwrap();
     assert_eq!(found.first().map(|s| s.source.as_str()), Some("venv"), "{found:?}");
-    let effective = ops::sdk::sdk_python_effective(&p.host, WINDOW, None).unwrap().expect("an interpreter");
+    let effective = ops::sdk::sdk_python_effective(&p.host, WINDOW, None).await.unwrap().expect("an interpreter");
     assert!(effective.starts_with(p.root.join(".venv")), "{effective:?}");
 }
 

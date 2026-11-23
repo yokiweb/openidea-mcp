@@ -23,6 +23,7 @@ import { revealRange, useEditorRegistry } from "@/editor/api";
 import { executeAction } from "@/platform/actions";
 import { tx, useTxTemplate } from "@/platform/i18n";
 import { isTauri } from "@/platform/ipc";
+import { canDragOut, dragOut, isDraggingOut } from "@/platform/dragOut";
 import { nativeDropPoint } from "@/platform/nativeDrop";
 import type { RootFolder } from "@/platform/languageSettings";
 import { useDetectedRoots, useEffectiveRoots } from "@/platform/projectRoots";
@@ -42,6 +43,7 @@ import {
   Popup,
   beginDrag,
   dragSession,
+  isOutsideWindow,
   registerDropTarget,
   Tree,
   acquirePopup,
@@ -86,6 +88,7 @@ import {
   VIEW_MODES,
   autoExpand,
   clearRevealRequest,
+  explainHiddenPath,
   loadDir,
   loadOutline,
   revealPath,
@@ -337,24 +340,29 @@ const Row = memo(function Row({
         />
       ) : (
         <>
-          <HighlightedText
-            className={clsx(
-              styles.label,
-              node.root && styles.rootName,
-              // Only the project itself is bold (IDEA); contributed roots like Scratches are not.
-              node.root && !node.icon && styles.rootLabel,
-              // Maven / Gradle module folders are bold too, as in IDEA.
-              moduleFolder && styles.moduleLabel,
-              faded && !deco.color && styles.excluded,
-              deco.error && styles.error,
+          <span className={styles.labelGroup}>
+            <HighlightedText
+              className={clsx(
+                styles.label,
+                // Project and module roots use semibold labels.
+                node.root && !node.icon && styles.rootLabel,
+                moduleFolder && styles.moduleLabel,
+                faded && !deco.color && styles.excluded,
+                file?.deprecated && styles.deprecated,
+                deco.error && styles.error,
+              )}
+              style={deco.color ? { color: deco.color } : undefined}
+              text={node.label}
+              indices={matches}
+              tone="accent"
+            />
+            {deco.suffix && <DecorationSuffix segments={deco.suffix} color={deco.suffixColor} />}
+            {detail && (
+              <span className={styles.detail} title={detail}>
+                {detail}
+              </span>
             )}
-            style={deco.color ? { color: deco.color } : undefined}
-            text={node.label}
-            indices={matches}
-            tone="accent"
-          />
-          {deco.suffix && <DecorationSuffix segments={deco.suffix} color={deco.suffixColor} />}
-          {detail && <span className={styles.detail}>{detail}</span>}
+          </span>
           {deco.badge && <span className={styles.badge}>{deco.badge}</span>}
         </>
       )}
@@ -418,8 +426,14 @@ const MemberRow = memo(function MemberRow({
       onPointerDown={(e) => onPointerDown(node, e)}
     >
       <SymbolBadge kind={badgeKind(item.kind)} className={styles.icon} />
-      <HighlightedText className={styles.label} text={item.name} indices={matches} tone="accent" />
-      {item.detail && <span className={styles.detail}>{item.detail}</span>}
+      <span className={styles.labelGroup}>
+        <HighlightedText className={styles.label} text={item.name} indices={matches} tone="accent" />
+        {item.detail && (
+          <span className={styles.detail} title={item.detail}>
+            {item.detail}
+          </span>
+        )}
+      </span>
     </span>
   );
 });
@@ -517,7 +531,7 @@ export function ProjectView() {
   // Select a revealed path once its row exists.
   useEffect(() => {
     if (!revealRequest) return;
-    const { path, focus, seq } = revealRequest;
+    const { path, focus, seq, explain } = revealRequest;
     const exact = model.keyOfPath.get(path);
     const loadingAncestors = info.pending.some((p) => p === path || isInside(path, p));
     if (!exact && loadingAncestors) return;
@@ -528,6 +542,8 @@ export function ProjectView() {
     handle.current?.reveal(key);
     revealing.current = false;
     if (focus) handle.current?.focus();
+    const shown = model.byKey.get(key)?.path;
+    if (explain && !exact && shown) explainHiddenPath(path, shown);
   }, [revealRequest, model, info]);
 
   // Autoscroll from source: follow the active editor.
@@ -646,11 +662,47 @@ export function ProjectView() {
       startY = e.clientY;
     let active = false;
     let paths: string[] = [];
+    // What an OS drag out of the window carries: groups ("External Libraries") have no folder.
+    let outPaths: string[] = [];
     // Files and folders can be dropped on the agent composer as references; an
     // editor opens only files, so folders carry the trailing slash `findDirs`
     // uses and the editor leaves them out.
     let files: DragSession | null = null;
     let endDrag: (() => void) | null = null;
+    // While dragging, the tree scrolls only when the pointer is near its top or bottom edge
+    // (IDEA's DnD autoscroll). Leaving the tree toward a drop target elsewhere (the terminal,
+    // an editor) keeps it where it is: WebKit's own autoscroll of the pressed scroll container
+    // would otherwise keep scrolling it toward the pointer. It never scrolls sideways: a pointer
+    // right of the tree would scroll its long rows out of view.
+    const scroller = containerRef.current?.querySelector<HTMLElement>('[role="tree"]') ?? null;
+    let held = scroller?.scrollTop ?? 0;
+    const heldLeft = scroller?.scrollLeft ?? 0;
+    let pointer: { x: number; y: number } | null = null;
+    let frame = 0;
+    const inside = (p: { x: number; y: number }) => {
+      const r = scroller?.getBoundingClientRect();
+      return !!r && p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
+    };
+    const keep = () => {
+      if (!scroller) return;
+      if (pointer && !inside(pointer)) scroller.scrollTop = held;
+      else held = scroller.scrollTop;
+      if (scroller.scrollLeft !== heldLeft) scroller.scrollLeft = heldLeft;
+    };
+    const edgeScroll = () => {
+      frame = 0;
+      if (!scroller || !pointer || !inside(pointer)) return;
+      const r = scroller.getBoundingClientRect();
+      const delta = pointer.y < r.top + 24 ? -8 : pointer.y > r.bottom - 24 ? 8 : 0;
+      const before = scroller.scrollTop;
+      scroller.scrollTop = Math.max(0, Math.min(scroller.scrollHeight - scroller.clientHeight, before + delta));
+      held = scroller.scrollTop;
+      if (held !== before) {
+        const target = folderAt(containerRef.current, pointer.x, pointer.y);
+        setDropTarget(target && !paths.some((p) => target.path === p || isInside(target.path, p)) ? target.key : null);
+        frame = requestAnimationFrame(edgeScroll);
+      }
+    };
     const move = (ev: PointerEvent) => {
       // A press with no button held is a reordered macOS tap, not a drag (see pointerDrag.ts).
       if (!(ev.buttons & 1)) {
@@ -667,12 +719,25 @@ export function ProjectView() {
         if (before.has(node.key)) setSelection(before, lead);
         const nodes = keys.map((k) => m.byKey.get(k)).filter((n): n is ProjectNode => !!n && !n.root && !n.placeholder);
         paths = nodes.map((n) => n.path);
+        outPaths = nodes.filter((n) => !n.group).map((n) => n.path);
         if (!paths.length) return cleanup();
         files = dragSession({
           type: FILES_DRAG,
           payload: nodes.map((n) => (n.dir ? `${n.path}/` : n.path)).join("\n"),
         });
       }
+      // Leaving the window hands the files to an OS drag: the app they land on copies them.
+      const viewport = { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+      if (outPaths.length && canDragOut() && isOutsideWindow(viewport, ev.clientX, ev.clientY)) {
+        const out = outPaths;
+        cleanup();
+        void dragOut(out);
+        return;
+      }
+      if (!pointer) scroller?.addEventListener("scroll", keep, { passive: true });
+      pointer = { x: ev.clientX, y: ev.clientY };
+      keep();
+      if (!frame) frame = requestAnimationFrame(edgeScroll);
       const target = folderAt(containerRef.current, ev.clientX, ev.clientY);
       const valid = target && !paths.some((p) => target.path === p || isInside(target.path, p));
       setDropTarget(valid ? target.key : null);
@@ -703,6 +768,10 @@ export function ProjectView() {
       }
     };
     const cleanup = () => {
+      scroller?.removeEventListener("scroll", keep);
+      cancelAnimationFrame(frame);
+      frame = 0;
+      pointer = null;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cleanup);
@@ -726,6 +795,7 @@ export function ProjectView() {
     void import("@tauri-apps/api/webview").then(({ getCurrentWebview }) =>
       getCurrentWebview()
         .onDragDropEvent((event) => {
+          if (isDraggingOut()) return;
           const p = event.payload;
           if (p.type === "leave") return setDropTarget(null);
           const { x, y } = nativeDropPoint(p.position);
@@ -863,7 +933,8 @@ export function ProjectView() {
         </div>
       )}
       <Tree<ProjectNode>
-        horizontalScroll
+        horizontalScroll={options.horizontalScroll}
+        speedSearchAbove
         aria-label="Project"
         focusContext="projectViewFocus"
         handleRef={setTreeHandle}

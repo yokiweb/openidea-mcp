@@ -12,6 +12,7 @@ import { useProject } from "@/platform/project";
 import {
   SettingsFormContext,
   SettingsPageFocusContext,
+  SettingsHeaderSlotContext,
   useSettingsPages,
   type SettingsPageContribution,
 } from "@/workbench/contributions";
@@ -161,55 +162,73 @@ function PageHost({
   const form = useSettingsFormFor(pageId, scope);
   const focus = useSettingsDialog((s) => s.focus);
   const pageFocus = useMemo(() => ({ focus, consume: () => useSettingsDialog.setState({ focus: null }) }), [focus]);
+  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null);
   if (!node) return <EmptyState title="Nothing found" icon="search" />;
   const Body = page?.component;
+  const parents = crumbs.slice(0, -1);
   return (
     <PageContext.Provider value={ctx}>
       <SettingsFormContext.Provider value={form}>
         <SettingsPageFocusContext.Provider value={pageFocus}>
-          <div className={styles.pageHeader}>
-            <div className={styles.crumbs} aria-label={tx("Breadcrumb")}>
-              {crumbs.map((c, i) => (
-                <span key={i} className={styles.crumb}>
-                  {i > 0 && <Icon name="chevron-right" size={12} className={styles.crumbSep} />}
-                  <span>
-                    <T>{c}</T>
+          <SettingsHeaderSlotContext.Provider value={headerSlot}>
+            <div className={styles.pageHeader}>
+              <div className={styles.crumbs} aria-label={tx("Breadcrumb")} title={crumbs.map((c) => tx(c)).join(" › ")}>
+                {parents.length > 0 && (
+                  <span className={styles.parentCrumbs}>
+                    {parents.map((c, i) => (
+                      <span key={i} className={styles.crumb}>
+                        <span className={styles.crumbLabel}>
+                          <T>{c}</T>
+                        </span>
+                        <Icon name="chevron-right" size={12} className={styles.crumbSep} />
+                      </span>
+                    ))}
                   </span>
+                )}
+                <span className={clsx(styles.crumbLabel, styles.currentCrumb)} aria-current="page">
+                  <T>{node.title}</T>
                 </span>
-              ))}
+              </div>
+              <div ref={setHeaderSlot} className={styles.headerSlot} />
+              {dirty && (
+                <button type="button" className={styles.reset} onClick={onReset}>
+                  <T>Reset</T>
+                </button>
+              )}
+              {projectScope && !spec?.ownScopeSwitch && <ScopeSwitch pageId={scopeKey} scope={scope} />}
+              <span className={styles.history}>
+                <IconButton
+                  icon="arrow-left"
+                  title="Back"
+                  size="small"
+                  disabled={!history.back}
+                  onClick={history.back}
+                />
+                <IconButton
+                  icon="arrow-right"
+                  title="Forward"
+                  size="small"
+                  disabled={!history.forward}
+                  onClick={history.forward}
+                />
+              </span>
             </div>
-            {dirty && (
-              <button type="button" className={styles.reset} onClick={onReset}>
-                <T>Reset</T>
-              </button>
+            {scope === "project" && (
+              <div className={styles.scopeNote}>
+                <Icon name="info" size={14} />
+                <T>Saved to .openidea/settings.toml in this project; overrides the global value.</T>
+              </div>
             )}
-            {projectScope && !spec?.ownScopeSwitch && <ScopeSwitch pageId={scopeKey} scope={scope} />}
-            <span className={styles.history}>
-              <IconButton icon="arrow-left" title="Back" size="small" disabled={!history.back} onClick={history.back} />
-              <IconButton
-                icon="arrow-right"
-                title="Forward"
-                size="small"
-                disabled={!history.forward}
-                onClick={history.forward}
-              />
-            </span>
-          </div>
-          {scope === "project" && (
-            <div className={styles.scopeNote}>
-              <Icon name="info" size={14} />
-              <T>Saved to .openidea/settings.toml in this project; overrides the global value.</T>
+            {globalNote && (
+              <div className={styles.scopeNote}>
+                <Icon name="info" size={14} />
+                <T>Saved to the global settings: used by new projects and by projects without their own value.</T>
+              </div>
+            )}
+            <div className={clsx(styles.pageBody, page?.bleed && styles.pageBodyBleed)}>
+              <PageErrorBoundary pageId={pageId}>{Body ? <Body /> : <GroupPage node={node} />}</PageErrorBoundary>
             </div>
-          )}
-          {globalNote && (
-            <div className={styles.scopeNote}>
-              <Icon name="info" size={14} />
-              <T>Saved to the global settings: used by new projects and by projects without their own value.</T>
-            </div>
-          )}
-          <div className={styles.pageBody}>
-            <PageErrorBoundary pageId={pageId}>{Body ? <Body /> : <GroupPage node={node} />}</PageErrorBoundary>
-          </div>
+          </SettingsHeaderSlotContext.Provider>
         </SettingsPageFocusContext.Provider>
       </SettingsFormContext.Provider>
     </PageContext.Provider>
@@ -310,7 +329,7 @@ export function SettingsLayout() {
 
   return (
     <SplitGroup id="settings" orientation="horizontal" storageKey="openidea.settings.layout" className={styles.layout}>
-      <SplitPanel id="navigation" defaultSize="240px" minSize="160px" maxSize="40%" className={styles.sidebar}>
+      <SplitPanel id="navigation" defaultSize="22.5%" minSize="160px" maxSize="40%" className={styles.sidebar}>
         <SearchField
           data-autofocus
           className={styles.search}
@@ -341,11 +360,11 @@ export function SettingsLayout() {
             isExpandable={(n) => n.children.length > 0}
             defaultExpanded={current ? ancestorKeys(tree, current.key) : []}
             expanded={query ? expanded : undefined}
+            indent={16}
             selected={current ? new Set([current.key]) : new Set()}
             onSelectionChange={(_sel, node) => node && selectPage(node.key)}
             multiSelect={false}
             speedSearch={false}
-            rowHeight={24}
             empty={
               <div className={styles.noMatch}>
                 <T>No matches</T>

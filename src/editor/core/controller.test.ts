@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EditorController, openFilePaths, useEditorStatus, useTabs } from "./controller";
+import { EditorController, openFilePaths, useEditorStatus, useTabErrors, useTabs } from "./controller";
 import { createMemoryBackend } from "./backend";
 import { initialTabsState } from "./model/tabs";
 import { useDocMeta } from "./model/document";
+import { storeSession } from "./model/session";
 import { resetDistractionFree, setDistractionFree } from "@/workbench/distractionFree";
+import * as contributions from "@/workbench/contributions";
 import {
   registerEditorKind,
   registerTextEditorWrapper,
@@ -11,6 +13,7 @@ import {
   useProjectViewLead,
 } from "@/workbench/contributions";
 import { registerActions } from "@/platform/actions";
+import { IpcError, type ErrorKind } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { useRemote } from "@/platform/remote";
 import { hideContextMenu, resolveMenuItems, useContextMenuStore } from "@/ui";
@@ -27,6 +30,75 @@ afterEach(() => {
   ctrl = null;
   useTabs.setState(initialTabsState(), true);
   useEditorStatus.setState({ status: null });
+});
+
+describe("restoring an editor session", () => {
+  const root = "/session-restore";
+  const existing = `${root}/existing.txt`;
+  const unavailable = `${root}/unavailable.txt`;
+  const text = "first\nsecond";
+  let controller: EditorController | undefined;
+
+  afterEach(() => {
+    controller?.stop();
+    controller = undefined;
+    storeSession(root, null);
+    useTabErrors.setState({}, true);
+    vi.restoreAllMocks();
+  });
+
+  async function restoreWithOpenError(kind: ErrorKind, message: string) {
+    storeSession(root, {
+      version: 1,
+      layout: { kind: "pane", tabs: [{ path: existing }, { path: unavailable }], active: 1 },
+      activePane: 0,
+      files: { [existing]: { anchor: 6, head: 6 } },
+    });
+    const backend = createMemoryBackend({ [existing]: text });
+    // For an absent path the memory backend serves sample text, not a disk error.
+    const open = backend.open.bind(backend);
+    vi.spyOn(backend, "open").mockImplementation(async (path) => {
+      if (path === unavailable) throw new IpcError({ kind, message });
+      return open(path);
+    });
+    const editor = (controller = new EditorController(backend));
+    editor.start();
+
+    const restoring = editor.restoreSession(root);
+    const state = useTabs.getState();
+    const selected = state.panes[state.activePane]!.active!;
+    // Restore opens the selected tab in the background. Join the same slot request.
+    await Promise.all([restoring, editor.ensureSlot(selected)]);
+    return { editor, selected };
+  }
+
+  it("silently drops a deleted selected file and restores the remaining tab", async () => {
+    const notify = vi.fn();
+    vi.spyOn(contributions, "notifications").mockReturnValue({ notify });
+    const { editor, selected } = await restoreWithOpenError("notFound", `No such file: ${unavailable}`);
+
+    expect(notify).not.toHaveBeenCalled();
+    expect(useTabErrors.getState()).toEqual({});
+    expect(openFilePaths(useTabs.getState())).toEqual([existing]);
+    expect(editor.slotFor(selected)).toBeNull();
+    expect(editor.activeInput()?.path).toBe(existing);
+
+    // In the app the visible tab's editor host requests this slot after selection changes.
+    const state = useTabs.getState();
+    const slot = await editor.ensureSlot(state.panes[state.activePane]!.active!);
+    expect(slot?.model.path).toBe(existing);
+    expect(slot?.state.doc.toString()).toBe(text);
+    expect(slot?.caret()).toMatchObject({ line: 1, col: 0 });
+  });
+
+  it("keeps a tab and reports its open error when access is denied", async () => {
+    const message = `Permission denied: ${unavailable}`;
+    const { editor, selected } = await restoreWithOpenError("permissionDenied", message);
+
+    expect(openFilePaths(useTabs.getState())).toEqual([existing, unavailable]);
+    expect(editor.activeInput()?.path).toBe(unavailable);
+    expect(useTabErrors.getState()).toEqual({ [selected]: message });
+  });
 });
 
 describe("EditorController", () => {
@@ -92,6 +164,19 @@ describe("EditorController", () => {
     expect(ctrl.nav.snapshot().entries.map((e) => e.path)).toEqual(["/p/x.ts", "/p/b.ts"]);
   });
 
+  it("goes back to a diff closed without leaving it first", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "a\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    const diff = { kind: "diff", key: "diff:/p/a.ts", path: "/p/a.ts" };
+    await ctrl.openInput(diff, { preview: true });
+    await ctrl.closeEverything();
+    await ctrl.back();
+    expect(ctrl.activeInput()?.key).toBe(diff.key);
+    await ctrl.back();
+    expect(ctrl.activeSlot!.model.path).toBe("/p/a.ts");
+  });
+
   it("goes back to a diff where it was left, open or closed", async () => {
     // The diff viewer gives the input that reopens it at its caret.
     const dispose = registerEditorKind({
@@ -115,6 +200,29 @@ describe("EditorController", () => {
       expect(ctrl.activeInput()).toMatchObject({ key: diff.key, data: { line: 7 } });
     } finally {
       dispose();
+    }
+  });
+
+  it("gives the keyboard to the next tab when the focused one closes", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "a\n", "/p/b.ts": "b\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    const first = ctrl.activeSlot!;
+    await ctrl.openFile("/p/b.ts", { focus: false });
+    const second = ctrl.activeSlot!;
+    const hosts = [document.createElement("div"), document.createElement("div")];
+    document.body.append(...hosts);
+    try {
+      const a = first.mount(hosts[0]!);
+      ctrl.onMounted(first);
+      const b = second.mount(hosts[1]!);
+      ctrl.onMounted(second);
+      b.focus();
+      expect(b.hasFocus).toBe(true);
+      await ctrl.closeActiveTab();
+      expect(a.hasFocus).toBe(true);
+    } finally {
+      hosts.forEach((h) => h.remove());
     }
   });
 
@@ -399,6 +507,39 @@ describe("EditorController", () => {
       .find((t) => t.input.path === "/p/b.ts")!.input.key;
     await ctrl.closeInput(key);
     expect(openFilePaths(useTabs.getState())).toEqual(["/p/a.ts"]);
+  });
+
+  it("offers Find Usages immediately before Go To in the editor context menu", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "one\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    const slot = ctrl.activeSlot!;
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const view = slot.mount(host);
+    vi.spyOn(view, "posAtCoords").mockReturnValue(null);
+    try {
+      ctrl.onContextMenu(slot, new MouseEvent("contextmenu"));
+      const items = useContextMenuStore.getState().menu!.items;
+      const goTo = items.findIndex((item) => "label" in item && item.label === "Go To");
+      expect(items[goTo - 1]).toEqual({ kind: "action", action: "find.usages", label: "Find Usages" });
+      const submenu = resolveMenuItems(items).find((item) => item.label === "Go To")!.submenu!;
+      expect(submenu.map((item) => (item.kind === "action" ? item.action : "-"))).toEqual([
+        "navigate.declaration",
+        "navigate.implementation",
+        "navigate.typeDeclaration",
+        "navigate.superMethod",
+        "navigate.relatedSymbol",
+        "navigate.gotoTest",
+        "-",
+        "navigate.callHierarchy",
+        "navigate.typeHierarchy",
+      ]);
+    } finally {
+      hideContextMenu();
+      slot.unmount();
+      host.remove();
+    }
   });
 
   it("builds IDEA's editor tab menu", async () => {

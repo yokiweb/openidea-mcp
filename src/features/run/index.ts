@@ -14,6 +14,7 @@ import {
   menuGroupItems,
   useDebugRunSessions,
   notifications,
+  provideRunConfigurationChecks,
   provideRunConfigurationLookup,
   provideRunOutput,
   registerMenuGroup,
@@ -25,6 +26,7 @@ import {
   registerTitleItem,
   registerToolWindow,
 } from "@/workbench/contributions";
+import { restartFlutterDaemon, selectFlutterDevice, useFlutterDevices } from "@/workbench/flutterDevices";
 import { chooserJustClosed, ConfigChooserOverlay } from "./ConfigChooser";
 import {
   compiledDebugPlan,
@@ -36,6 +38,7 @@ import {
   runContextAction,
 } from "./contextRun";
 import { runWithExecutor } from "./executors";
+import { notifyCwdError, withExpandedCwd } from "./cwdMacros";
 import { debugWithAgent, jdwpLaunch } from "./javaDebug";
 import { attachesToChild, debugAttachingToChild } from "./pluginAttach";
 import { RunDialogsOverlay } from "./dialogs";
@@ -58,16 +61,21 @@ import {
 import { liveServiceSession, serviceSessions } from "./serviceSessions";
 import { ServiceImportHost } from "./serviceImport";
 import { cmakeBuildId } from "./cmake";
+import { configurationChecks } from "./configurationChecks";
 import { runBeforeLaunch } from "./beforeLaunch";
 import { compoundChildren } from "./configs";
 import { containerDebuggable, remoteDebugBlocked } from "./remote";
 import { debugInContainer } from "./containerDebug";
 import { isDebugOnly, registerBuiltinTypes } from "./types";
+import { isZigBuildStep, zigDebugTarget } from "./zigDebug";
 import { junitType } from "./junitType";
 import { listenForApplicationDeactivation, showApplicationUpdate, updatableSessions } from "./applicationUpdate";
+import { hotReload, hotReloadSession, hotRestart } from "./flutterHotReload";
 import { npmGutter } from "./npmGutter";
+import { startNpmScriptsWatch } from "./npmScripts";
 import { launchSettingsGutter } from "./launchSettingsGutter";
 import { runGutter } from "./runGutter";
+import { markdownCommandGutter } from "./markdownCommands";
 import { gradleDelegation } from "./gradleRun";
 import { activateStackTrace, useStackTraces } from "./stackTrace";
 import { clearRuntimeCache } from "./runtimes";
@@ -156,7 +164,11 @@ async function runSelected() {
     useRun.setState({ chooserOpen: true, chooserMode: "run" });
     return;
   }
-  const target = selectedTarget(config.id, useRun.getState().sessions, useDebugRunSessions.getState().sessions);
+  // As in IDEA, Run starts another instance of a configuration that allows multiple instances;
+  // otherwise it restarts the running one.
+  const target = config.allowParallel
+    ? null
+    : selectedTarget(config.id, useRun.getState().sessions, useDebugRunSessions.getState().sessions);
   if (target) {
     target.rerun?.();
     return;
@@ -176,6 +188,11 @@ async function debugConfig(config: RunConfig, chain: readonly string[] = [], sho
 }
 
 async function debugLaunch(config: RunConfig, chain: readonly string[], show?: boolean): Promise<void> {
+  try {
+    config = await withExpandedCwd(config);
+  } catch (e) {
+    return notifyCwdError(config, e);
+  }
   if (!(await prepareLaunch(config, chain, show))) return;
   if (config.kind === UNITY_CONFIG_KIND) return showUnityAttach(config);
   // Python on a Docker / Compose target: debugpy in the container, the debugger attaches.
@@ -220,6 +237,21 @@ async function debugLaunch(config: RunConfig, chain: readonly string[], show?: b
   if (jdwpLaunch(config) && getAction("debug.attach")) {
     await debugWithAgent(config, show);
     return;
+  }
+  // `zig build run` (and other steps that run an executable) have no adapter of their own: debug
+  // through the executable config, which builds the binary first and launches it under CodeLLDB.
+  if (isZigBuildStep(config)) {
+    const target = zigDebugTarget(config, useRun.getState().configs);
+    if (target && getAction("debug.startConfig")) {
+      // Run the executable's before-launch build, then keep the clicked step as the session's
+      // origin so the Run widget, tab identity, rerun and stop follow what the user asked to debug.
+      if (!(await prepareLaunch(target, [config.id], show))) return;
+      await executeAction(
+        "debug.startConfig",
+        show === false ? { config: target, origin: config, show: false } : { config: target, origin: config },
+      );
+      return;
+    }
   }
   if (getAction("debug.startConfig")) {
     await executeAction("debug.startConfig", show === false ? { config, show: false } : config);
@@ -406,6 +438,7 @@ export function activate(): () => void {
       headerContent: lazyComponent(() => import("./RunView").then((m) => m.RunTabs)),
       useBadge: useRunningCount,
     }),
+    startNpmScriptsWatch(),
     registerTitleItem({ id: "run.widget", title: "Run Widget", align: "right", priority: 0, component: RunWidget }),
     registerRunAnythingProvider(runConfigsRunAnything),
     registerBuiltinTypes(),
@@ -463,6 +496,7 @@ export function activate(): () => void {
     }),
     registerEditorContribution({ id: "run.targets", order: 55, extensions: runGutter }),
     registerEditorContribution({ id: "run.npmScripts", order: 58, extensions: npmGutter }),
+    registerEditorContribution({ id: "run.markdownCommands", order: 58, extensions: markdownCommandGutter }),
     registerEditorContribution({ id: "run.launchSettings", order: 58, extensions: launchSettingsGutter }),
     registerMenuGroup({
       id: "run.context",
@@ -557,6 +591,58 @@ export function activate(): () => void {
         icon: "rerun",
         when: "projectOpen && activeToolWindow == 'run'",
         run: () => rerunActive(),
+      },
+      {
+        id: "run.flutterChooseDevice",
+        title: "Select Flutter Device…",
+        category: "Run",
+        when: "flutterProject",
+        run: () => {
+          const chooserOpen = !useFlutterDevices.getState().chooserOpen;
+          useFlutterDevices.setState({ chooserOpen });
+          if (chooserOpen) void call(commands.flutterDevicesRefresh()).catch(() => undefined);
+        },
+      },
+      {
+        id: "run.flutterSelectDevice",
+        title: "Use Flutter Device",
+        category: "Run",
+        hidden: true,
+        when: "flutterProject",
+        run: ({ arg }) => {
+          if (typeof arg === "string") selectFlutterDevice(arg);
+        },
+      },
+      {
+        id: "run.flutterRestartDaemon",
+        title: "Restart Flutter Daemon",
+        category: "Run",
+        when: "flutterProject",
+        run: () => restartFlutterDaemon(),
+      },
+      {
+        id: "run.flutterHotReload",
+        title: "Hot Reload",
+        category: "Run",
+        icon: "hot-reload",
+        description: "Flutter: inject the changed sources into the running app",
+        when: "run.flutterHotReloadable",
+        run: () => {
+          const session = hotReloadSession();
+          if (session) hotReload(session.id);
+        },
+      },
+      {
+        id: "run.flutterHotRestart",
+        title: "Hot Restart",
+        category: "Run",
+        icon: "refresh",
+        description: "Flutter: restart the app, discarding its state",
+        when: "run.flutterHotReloadable",
+        run: () => {
+          const session = hotReloadSession();
+          if (session) hotRestart(session.id);
+        },
       },
       {
         id: "run.chooseConfig",
@@ -673,6 +759,26 @@ export function activate(): () => void {
         when: "projectOpen && activeToolWindow == 'run'",
         keyWhen: TEST_TREE_FOCUS,
         run: () => testTree.collapseAll?.(),
+      },
+      {
+        id: "run.exportTestResults",
+        title: "Export Test Results…",
+        description: "Save the test results as an HTML report or IDEA's XML",
+        category: "Run",
+        icon: "export",
+        when: "projectOpen && activeToolWindow == 'run'",
+        keywords: ["test", "results", "report", "html", "xml", "save"],
+        enabled: () => testTree.exportResults !== null,
+        run: () => testTree.exportResults?.(),
+      },
+      {
+        id: "run.toggleTestDurations",
+        title: "Show Test Durations",
+        category: "Run",
+        when: "projectOpen",
+        enabled: () => testTree.toggleDurations !== null,
+        toggled: () => testTree.showDurations === true,
+        run: () => testTree.toggleDurations?.(),
       },
       {
         id: "run.reloadConfigs",
@@ -801,6 +907,7 @@ export function activate(): () => void {
       const cmake = selected ?? s.configs.find((c) => c.kind === "cmake" && c.args[0] === "--build");
       setContext("run.cmakeBuild", cmakeBuildId(cmake, s.configs));
       setContext("run.updatableRunning", updatableSessions().length > 0);
+      setContext("run.flutterHotReloadable", !!hotReloadSession());
     }),
     // Agent tabs (`run_command`): the archive keeps at most Settings' number of them.
     useRun.subscribe((s, prev) => {
@@ -817,6 +924,8 @@ export function activate(): () => void {
 
   setBeforeLaunchRunner(runBeforeLaunch);
   disposers.push(() => setBeforeLaunchRunner(null));
+  provideRunConfigurationChecks(configurationChecks);
+  disposers.push(() => provideRunConfigurationChecks(undefined));
   provideRunOutput({ subscribe: subscribeOutput });
   disposers.push(() => provideRunOutput(undefined));
   provideRunConfigurationLookup((kind, directory) => {

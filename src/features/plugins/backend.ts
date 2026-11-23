@@ -9,6 +9,7 @@ import type {
   ActiveTheme,
   CapabilityInfo,
   CatalogPlugin,
+  ClipboardAnswer,
   CommitAnswer,
   CommandAnswer,
   CommitSelection,
@@ -23,6 +24,8 @@ import type {
   PluginContextKey,
   PluginEditor,
   PluginEndpoint,
+  PluginSearchPage,
+  RequestId,
   PluginEvent,
   PluginInfo,
   PluginOutputLine,
@@ -103,6 +106,8 @@ export interface PluginsBackend {
   finishOperation(id: string, status: number | null, stopped: boolean): Promise<void>;
   contentTabAction(pluginId: string, action: import("@/bindings").ContentTabAction): Promise<void>;
   answerCommit(requestId: string, answer: CommitAnswer): Promise<void>;
+  /** This window's clipboard for a plugin's `clipboardRequested`. */
+  answerClipboard(requestId: string, answer: ClipboardAnswer): Promise<void>;
   /** Runs plugins' before-commit checks on what `selection` commits. */
   commitChecks(selection: CommitSelection, checks: PluginCommitCheckRef[]): Promise<PluginCommitCheckResult[]>;
   /** Marketplace plugins: the index read again (`refresh`) or the last one read. */
@@ -134,6 +139,13 @@ export interface PluginsBackend {
   runTargets(): Promise<import("@/bindings").RegisteredRunTarget[]>;
   answerRunTarget(id: string, useTarget: boolean): Promise<import("@/bindings").Settings>;
   endpoints(pluginId: string): Promise<PluginEndpoint[]>;
+  search(
+    pluginId: string,
+    category: string,
+    query: string,
+    limit: number,
+    request: RequestId,
+  ): Promise<PluginSearchPage>;
   /**
    * Runs the program of node `key`'s log tab `tab` (with the toggles in `on`) and streams its
    * lines until it exits (`onExit`) or the returned stop function is called.
@@ -296,6 +308,9 @@ export const tauriPluginsBackend: PluginsBackend = {
   answerCommit: async (requestId, answer) => {
     await commands.pluginAnswerCommit(requestId, answer);
   },
+  answerClipboard: async (requestId, answer) => {
+    await call(commands.pluginAnswerClipboard(requestId, answer));
+  },
   commitChecks: (selection, checks) => call(commands.pluginCommitChecks(selection, checks, nextRequestId())),
   market: (refresh) => call(commands.pluginMarket(refresh)),
   marketUrl: () => commands.pluginMarketUrl(),
@@ -336,6 +351,8 @@ export const tauriPluginsBackend: PluginsBackend = {
   runTargets: () => call(commands.pluginRunTargets()),
   answerRunTarget: (id, useTarget) => call(commands.pluginAnswerRunTarget(id, useTarget)),
   endpoints: (pluginId) => call(commands.pluginEndpoints(pluginId)),
+  search: (pluginId, category, query, limit, request) =>
+    call(commands.pluginSearch(pluginId, category, query, limit, request)),
   serviceLog: (pluginId, view, key, tab, on, onLine, onError, onExit) => {
     const request = nextRequestId();
     const channel = new Channel<PluginOutputLine>();
@@ -370,7 +387,8 @@ export const tauriPluginsBackend: PluginsBackend = {
     await call(commands.pluginSetSecret(pluginId, name, value));
   },
   setActiveFile: async (path) => {
-    await commands.pluginSetActiveFile(path);
+    const editor = editorContext();
+    await commands.pluginSetActiveFile(path, editor && editor.path === path ? editor : null);
   },
   setTheme: (pluginId, themeId) => call(commands.pluginSetTheme(pluginId, themeId)),
   setThemeFrame: async (color) => {
@@ -453,6 +471,7 @@ function samplePlugins(): PluginInfo[] {
     homepage: null,
     changeNotes: null,
     icon: null,
+    javaAgent: null,
     source: "installed" as const,
     enabled: true,
     error: null,
@@ -709,6 +728,7 @@ export function createMemoryPluginsBackend(
     runTargets: async () => [],
     answerRunTarget: async () => useProject.getState().settings as import("@/bindings").Settings,
     endpoints: async () => [],
+    search: async () => ({ items: [], hasMore: false }),
     answerCommand: async () => {},
     finishOperation: async () => {},
     closeTerminalSession: async () => {},
@@ -719,6 +739,7 @@ export function createMemoryPluginsBackend(
     selectTests: async () => null,
     contentTabAction: async () => {},
     answerCommit: async () => {},
+    answerClipboard: async () => {},
     commitChecks: async () => [],
     serviceLog: (pluginId, view, key, _tab, _on, _onLine, onError) => {
       onError(`${pluginId} · ${view} · ${key}: logs need the desktop app`);

@@ -871,6 +871,7 @@ pub(super) fn history(thread: &Value, cwd: Option<&str>) -> Vec<Value> {
                     if !text.is_empty() {
                         out.push(chunk("agent_message_chunk", text));
                     }
+                    out.extend(question_update(item));
                 }
                 Some("reasoning") => {
                     let text = reasoning_text(item);
@@ -888,6 +889,36 @@ pub(super) fn history(thread: &Value, cwd: Option<&str>) -> Vec<Value> {
         }
     }
     out
+}
+
+/// Structured async questions accompany a completed message, even when its text streamed already.
+pub(super) fn question_update(item: &Value) -> Option<Value> {
+    let id = item.get("id")?.as_str().filter(|id| !id.is_empty())?;
+    let questions: Vec<Value> = item
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter_map(|(index, q)| {
+            let title = q.get("title")?.as_str().filter(|title| !title.trim().is_empty())?;
+            let options: Vec<Value> = q
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|label| !label.trim().is_empty())
+                .map(|label| json!({ "label": label, "description": "" }))
+                .collect();
+            Some(json!({ "answerKey": json!(["request_user_input_async", id, index]).to_string(),
+            "question": title, "header": "", "multiSelect": false, "options": options }))
+        })
+        .collect();
+    if questions.is_empty() {
+        return None;
+    }
+    Some(json!({ "sessionUpdate": "user_question", "id": id,
+        "title": questions[0]["question"], "questions": questions }))
 }
 
 /// A reasoning item's summary (or, without one, its raw text).
@@ -923,8 +954,18 @@ fn str_of(v: &Value, key: &str) -> Option<String> {
 
 /// Session-scoped MCP configuration, carried in thread/start, resume and fork.
 pub(super) fn mcp_config(params: &Value) -> Option<Value> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+    let cwd = params.get("cwd").and_then(Value::as_str).map_or_else(|| std::path::Path::new("."), std::path::Path::new);
+    let external = crate::mcp::codex_external_server_names(home.as_deref(), cwd);
+    mcp_config_with_external(params, &external)
+}
+
+pub(super) fn mcp_config_with_external(
+    params: &Value,
+    external_names: &std::collections::BTreeSet<String>,
+) -> Option<Value> {
     let mut servers = serde_json::Map::new();
-    for server in params.get("mcpServers")?.as_array()? {
+    for server in params.get("mcpServers").and_then(Value::as_array).into_iter().flatten() {
         if server.get("type").and_then(Value::as_str).is_some_and(|t| t != "stdio") {
             continue;
         }
@@ -945,6 +986,17 @@ pub(super) fn mcp_config(params: &Value) -> Option<Value> {
             json!({"command":command,
             "args":server.get("args").cloned().unwrap_or_else(||json!([])),"env":env}),
         );
+    }
+    for name in params
+        .pointer("/_meta/openidea/mcpServersOff")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !servers.contains_key(name) && external_names.contains(name) {
+            servers.insert(name.to_owned(), json!({ "enabled": false }));
+        }
     }
     (!servers.is_empty()).then(|| json!({"mcp_servers":servers}))
 }

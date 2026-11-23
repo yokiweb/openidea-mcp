@@ -60,26 +60,27 @@ async fn linked_projects_share_navigation_but_keep_files_repositories_and_run_di
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), configs.len());
-    let a = ops::doc::open(&host, "main", roots[0].join("same.txt")).await.unwrap();
-    let b = ops::doc::open(&host, "main", roots[1].join("same.txt")).await.unwrap();
+    let a = ops::doc::doc_open(&host, "main", roots[0].join("same.txt")).await.unwrap();
+    let b = ops::doc::doc_open(&host, "main", roots[1].join("same.txt")).await.unwrap();
     assert_ne!(a.id, b.id);
-    ops::doc::edit(
+    ops::doc::doc_edit(
         &host,
         "main",
         a.id,
         a.version,
         ChangeSet { changes: vec![TextChange { from: 0, to: 0, insert: "unsaved ".into() }] },
     )
+    .await
     .unwrap();
     let hits = Arc::new(Mutex::new(Vec::new()));
     let out = hits.clone();
     let query = serde_json::from_value(serde_json::json!({"pattern":"needle", "isRegex":false, "caseSensitive":false,"wholeWord":false,"include":[],"exclude":[],"scope":{"kind":"project"},"maxMatches":100})).unwrap();
-    ops::search::start(
+    ops::search::search_start(
         &host,
         "main",
         RequestId::next(),
         query,
-        Arc::new(move |event| {
+        ops::Channel::new(move |event| {
             if let ops::search::SearchEvent::File { file } = event {
                 out.lock().unwrap().push(file);
             }
@@ -150,12 +151,12 @@ async fn a_project_attached_inside_the_root_is_searched_and_indexed_once() {
     let hits = Arc::new(Mutex::new(Vec::new()));
     let out = hits.clone();
     let query = serde_json::from_value(serde_json::json!({"pattern":"needle", "isRegex":false, "caseSensitive":false,"wholeWord":false,"include":[],"exclude":[],"scope":{"kind":"project"},"maxMatches":100})).unwrap();
-    ops::search::start(
+    ops::search::search_start(
         &host,
         "main",
         RequestId::next(),
         query,
-        Arc::new(move |event| {
+        ops::Channel::new(move |event| {
             if let ops::search::SearchEvent::File { file } = event {
                 out.lock().unwrap().push(file.rel_path);
             }
@@ -198,7 +199,9 @@ async fn python_effective_interpreter_falls_back_to_the_primary_project() {
     host.trust.decide(&member, true, false).unwrap();
     host.open_project("main", &primary).unwrap();
     let python = |near: Option<&std::path::Path>| {
-        ops::sdk::sdk_python_effective(&host, "main", near.map(|p| p.to_path_buf())).unwrap().map(|p| p.into_path_buf())
+        futures::executor::block_on(ops::sdk::sdk_python_effective(&host, "main", near.map(|p| p.to_path_buf())))
+            .unwrap()
+            .map(|p| p.into_path_buf())
     };
     // The primary project's own virtualenv, and the bare member inheriting it.
     assert_eq!(python(Some(&primary)), Some(venv_python.clone()));
@@ -216,6 +219,13 @@ async fn python_effective_interpreter_falls_back_to_the_primary_project() {
         )
         .unwrap();
     assert_eq!(python(Some(&member.join("src"))), Some(configured));
+    // A workspace file that fails to load (a corrupt one, say) falls back to the
+    // primary project's interpreter instead of failing the whole command.
+    let workspace_file = primary.join(ide_workspace::workspace::FILE);
+    let valid = std::fs::read(&workspace_file).unwrap();
+    std::fs::write(&workspace_file, b"{not json").unwrap();
+    assert_eq!(python(Some(&member.join("src"))), Some(venv_python.clone()));
+    std::fs::write(&workspace_file, valid).unwrap();
     host.close_project("main");
 }
 
@@ -338,14 +348,15 @@ async fn attach_and_detach_preserve_the_primary_project_session() {
     let configs = ops::run::configs(&host, "main").unwrap();
     assert!(!configs.is_empty());
     let cache = project.build_cache_dir();
-    let doc = ops::doc::open(&host, "main", roots[0].join("same.txt")).await.unwrap();
-    ops::doc::edit(
+    let doc = ops::doc::doc_open(&host, "main", roots[0].join("same.txt")).await.unwrap();
+    ops::doc::doc_edit(
         &host,
         "main",
         doc.id,
         doc.version,
         ChangeSet { changes: vec![TextChange { from: 0, to: 0, insert: "unsaved ".into() }] },
     )
+    .await
     .unwrap();
     assert!(ops::project::attach_workspace(&host, "main", &roots[1]).is_err());
     host.trust.decide(&roots[1], false, false).unwrap();
@@ -393,12 +404,12 @@ async fn attach_and_detach_preserve_the_primary_project_session() {
     let hits = Arc::new(Mutex::new(Vec::new()));
     let out = hits.clone();
     let query = serde_json::from_value(serde_json::json!({"pattern":"needle", "isRegex":false,"caseSensitive":false,"wholeWord":false,"include":[],"exclude":[],"scope":{"kind":"project"},"maxMatches":100})).unwrap();
-    ops::search::start(
+    ops::search::search_start(
         &host,
         "main",
         RequestId::next(),
         query,
-        Arc::new(move |event| {
+        ops::Channel::new(move |event| {
             if let ops::search::SearchEvent::File { file } = event {
                 out.lock().unwrap().push(file);
             }

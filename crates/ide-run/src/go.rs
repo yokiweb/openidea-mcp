@@ -124,6 +124,11 @@ fn package_info(mut command: Command, dir: &Path, flags: &[String]) -> IdeResult
         }
     }
     command.arg(".").current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(ide_core::process::CREATE_NO_WINDOW);
+    }
     let mut child = command.spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -267,6 +272,7 @@ pub fn prepare_test_file(root: &Path, config: &mut RunConfig) -> IdeResult<()> {
     let file = root.join(p.get("module").map(String::as_str).unwrap_or(".")).join(target);
     let dir = file.parent().ok_or_else(|| IdeError::invalid("Go test file has no directory"))?;
     let mut command = Command::new(&config.command);
+    command.current_dir(dir);
     crate::process::configure_environment(&mut command, root, config)?;
     let exclusions = file_test_exclusions(command, &file, &config.args)?;
     let at = config

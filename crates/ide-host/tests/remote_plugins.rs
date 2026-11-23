@@ -1080,3 +1080,82 @@ async fn cancelling_one_request_does_not_interrupt_another_running_command() {
     assert_eq!(plugins.host().info_of("jobs").unwrap().stats.crashes, 0);
     plugins.host().shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_focus_preserves_the_editor_for_following_plugin_events() {
+    let (tmp, plugins, peer, _client) = command_rpc_fixture().await;
+    plugins.host().install_from_dir(&fixture("api14"), &Consent::all()).unwrap();
+    let path = tmp.path().join("project/notes.txt").to_string_lossy().into_owned();
+    let selection = json!({"start":{"line":4,"col":2},"end":{"line":4,"col":5}});
+    invoke(
+        &peer,
+        "plugin_set_active_file",
+        json!({"path":path,"editor":{"path":path,"language":"text","selections":[selection]}}),
+    )
+    .await
+    .unwrap();
+    for focused in [true, false] {
+        if !focused {
+            invoke(&peer, "plugin_set_active_file", json!({"path":null,"editor":null})).await.unwrap();
+        }
+        plugins.host().post_events(
+            Some("main"),
+            vec![WorkbenchEvent::InputModeChanged(ide_plugin::InputMode {
+                path: path.clone(),
+                mode: "visual".into(),
+                sub: None,
+            })],
+        );
+        plugins.host().flush_events_at(std::time::Instant::now() + Duration::from_secs(2));
+        assert!(plugins.host().wait_events(Duration::from_secs(5)));
+        let received = invoke(
+            &peer,
+            "plugin_run_command",
+            json!({"pluginId":"api14","commandId":"events","arg":null,"editor":null}),
+        )
+        .await
+        .unwrap();
+        let events: Value = serde_json::from_str(received.as_str().unwrap()).unwrap();
+        let event = events.as_array().unwrap().iter().rev().find(|e| e["kind"] == "input-mode-changed").unwrap();
+        if focused {
+            assert_eq!(event["editor"], json!([path, [[4, 2, 4, 5]]]));
+        } else {
+            assert!(event["editor"].is_null(), "lost focus must clear the previous editor: {event}");
+        }
+    }
+    // Older callers may omit the optional editor payload.
+    invoke(&peer, "plugin_set_active_file", json!({"path":path})).await.unwrap();
+    plugins.host().shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_command_reads_the_clipboard_of_the_desktop_window() {
+    let (_tmp, plugins, peer, client) = command_rpc_fixture().await;
+    plugins.host().install_from_dir(&fixture("clipboard"), &Consent::all()).unwrap();
+    let read = tokio::spawn({
+        let peer = peer.clone();
+        async move {
+            invoke(&peer, "plugin_run_command", json!({ "pluginId": "test.clipboard", "commandId": "read" })).await
+        }
+    });
+    until("the server asks the window for its clipboard", 5, || {
+        client.plugin_events.lock().iter().any(|m| matches!(m.event, PluginEvent::ClipboardRequested { .. }))
+    })
+    .await;
+    let (window, request) = client
+        .plugin_events
+        .lock()
+        .iter()
+        .find_map(|m| match &m.event {
+            PluginEvent::ClipboardRequested { request_id, .. } => Some((m.window.clone(), request_id.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(window.as_deref(), Some("main"), "the invoking window reads its own clipboard");
+    let answer = json!({ "kind": "content", "text": "from the desktop", "png": null });
+    let answered = invoke(&peer, "plugin_answer_clipboard", json!({ "requestId": request, "answer": answer }));
+    assert_eq!(answered.await.unwrap(), true);
+    let reply = tokio::time::timeout(Duration::from_secs(5), read).await.unwrap().unwrap().unwrap();
+    assert_eq!(reply, "text=from the desktop image=-");
+    plugins.host().shutdown();
+}

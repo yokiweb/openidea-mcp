@@ -139,7 +139,7 @@ async fn database_connect_asks_only_the_invoking_window_and_uses_normal_connecti
     assert_eq!(window, "main");
     assert!(!f.plugins.answer_command("second", &request, ide_host::plugins::CommandAnswer::Value(None)));
     tokio::time::sleep(Duration::from_millis(350)).await; // Password entry can outlive the 250 ms command budget.
-    ops::db::connect(&f.host, "main", &source).await.unwrap();
+    ops::db::db_connect(&f.host, "main", source.to_string()).await.unwrap();
     f.plugins.answer_command("main", &request, ide_host::plugins::CommandAnswer::Value(None));
     run.await.unwrap().unwrap();
     assert!(!f.host.project("main").unwrap().db.connected().is_empty());
@@ -191,6 +191,41 @@ async fn mcp_listing_dispatch_confirmation_and_lifecycle_use_plugin_authority() 
     let spin =
         tokio::task::spawn_blocking(move || r.call(&root, "test_data_tools__spin", "{}", CancellationToken::new()));
     assert!(spin.await.unwrap().is_err(), "command budget interrupts wasm");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_tool_call_holds_its_background_project_until_it_ends() {
+    use ide_host::mcp::{BackgroundProjects, McpBackgroundHold};
+    // The fixture's `spin` runs until it is cancelled or its budget ends.
+    let f = Harness::with_timeout(Duration::from_secs(10));
+    let inventory = f.root.parent().unwrap().join("inventory");
+    std::fs::create_dir(&inventory).unwrap();
+    for (key, value) in [
+        ("enabled", serde_json::json!(true)),
+        ("backgroundProjects", serde_json::json!("listed")),
+        ("backgroundProjectPaths", serde_json::json!([inventory])),
+    ] {
+        let key = format!("mcpServer.{key}");
+        f.host.global_settings.set(ide_workspace::SettingsScope::Global, &key, value).unwrap();
+    }
+    let held_by = || {
+        let loaded = f.host.mcp_background.snapshot(&f.host, std::time::Instant::now());
+        loaded.into_iter().next().map(|project| project.kept_open_by)
+    };
+    let (registry, root, cancel) = (Registry::new(f.host.clone()), inventory.clone(), CancellationToken::new());
+    let stop = cancel.clone();
+    let call = tokio::task::spawn_blocking(move || registry.call(&root, "test_data_tools__spin", "{}", cancel));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while held_by() != Some(Some(McpBackgroundHold::Request)) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the call holds the project while the plugin runs");
+    stop.cancel();
+    assert!(call.await.unwrap().is_err());
+    assert_eq!(held_by(), Some(None), "the project stays loaded with nothing holding it");
+    f.host.close_project(&BackgroundProjects::key(&inventory));
 }
 
 #[tokio::test(flavor = "multi_thread")]

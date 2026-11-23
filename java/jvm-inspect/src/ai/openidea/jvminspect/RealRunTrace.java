@@ -6,6 +6,7 @@ import ai.openidea.jvminspect.JavaDebugSessions.HubEvent;
 import ai.openidea.jvminspect.RealRunPlan.StepSpec;
 import com.sun.jdi.AbsentInformationException;
 import com.sun.jdi.ArrayReference;
+import com.sun.jdi.BooleanValue;
 import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
 import com.sun.jdi.IncompatibleThreadStateException;
@@ -30,6 +31,8 @@ import com.sun.jdi.event.MethodExitEvent;
 import com.sun.jdi.event.VMDeathEvent;
 import com.sun.jdi.event.VMDisconnectEvent;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
+import com.sun.jdi.request.ExceptionRequest;
 import com.sun.jdi.request.MethodEntryRequest;
 import com.sun.jdi.request.MethodExitRequest;
 import com.sun.jdi.request.StepRequest;
@@ -162,11 +165,17 @@ final class RealRunTrace {
     /** Recorder number of the next wrapped op; modifiers take none. */
     private int nextStep;
     private ObjectReference lastWrapped;
+    /** Whether the stream was made sequential: the plan asked, or the stream the chain starts from was parallel. */
+    private volatile boolean sequentialized;
     /** {@code forceEarlyReturn} at a method exit makes that frame exit once more, returning the forced value. */
     private Method echoMethod;
     private Value echoValue;
     private EventSet parked;
     private Method terminalMethod;
+    /** Stops the thread at a throw of the terminal's that nothing catches; see {@link #watchUncaught}. */
+    private volatile EventRequest uncaught;
+    /** {@code collect} ran, so the client's step-out ended in a stop of its own; see {@link #dispose}. */
+    private volatile boolean steppedOut;
 
     private RealRunTrace(long id, VirtualMachine vm, ThreadReference thread, RealRunPlan plan, int budget, long generation) {
         this.id = id;
@@ -240,11 +249,14 @@ final class RealRunTrace {
         subscription = hub.subscribe(this::onEvent, e -> errors.add("event listener: " + e));
         if (held != null) {
             // Not put back: the program consumes the stream right after.
-            lastWrapped = wrap(held, nextStep++, plan.sequentialize());
+            // A stream made parallel before this statement shows no `parallel` in the chain.
+            sequentialized = plan.sequentialize() || isParallel(held);
+            lastWrapped = wrap(held, nextStep++, sequentialized);
             // The invokes resumed the thread, which invalidated the frame read before them.
             thread.frame(0).setValue(local, lastWrapped);
         } else {
             rootSkip = plan.root().skip();
+            sequentialized = plan.sequentialize();
         }
         // Last: with these on, an invoke into the thread would raise the trace's own events inside it.
         // The step out of the frame never fires inside an invoke, which runs above it.
@@ -402,7 +414,8 @@ final class RealRunTrace {
             }
             ObjectReference stream = returned(exit, root);
             setEnabled(false);
-            replace(exit, wrap(stream, nextStep++, plan.sequentialize()));
+            if (!sequentialized && isParallel(stream)) sequentialized = true;
+            replace(exit, wrap(stream, nextStep++, sequentialized));
             return;
         }
         if (method.isStatic() || method.isConstructor() || !calledByUser() || !lastWrapped.equals(thread.frame(0).thisObject())) return;
@@ -507,6 +520,8 @@ final class RealRunTrace {
         }
         if (outcome instanceof ObjectReference object) keep(pinned(object));
         restoreSilencers();
+        // Before the state moves: the client steps out as soon as it sees the trace parked.
+        if (kind.equals("threw")) watchUncaught((ObjectReference) outcome);
         boolean hold;
         synchronized (stateLock) {
             terminalKind = kind;
@@ -525,8 +540,60 @@ final class RealRunTrace {
         if (hold) {
             parked = set;
             terminalMethod = method;
+        } else {
+            deleteUncaught();
         }
         return hold;
+    }
+
+    /**
+     * Worker, before the trace parks on a terminal that threw. The client's step-out ends in the
+     * program's catch, but an exception nothing catches ends the thread, with no stop left to read the
+     * records in. This request stops the thread at that throw instead: java-debug reports every
+     * exception event as a stop. Not when an enabled request of java-debug's, or an exception breakpoint
+     * without class filters, already stops there, since the throw would then be reported twice.
+     */
+    private void watchUncaught(ObjectReference exception) {
+        try {
+            EventRequestManager manager = vm.eventRequestManager();
+            ReferenceType type = exception.referenceType();
+            for (ExceptionRequest r : manager.exceptionRequests()) {
+                if (r.isEnabled() && r.notifyUncaught() && r.getProperty(Silencer.OWN_PROPERTY) == null && covers(r.exception(), type)
+                        && ExceptionBreakpoints.coversWholeType(r)) {
+                    return;
+                }
+            }
+            ExceptionRequest r = manager.createExceptionRequest(null, false, true);
+            r.addThreadFilter(thread);
+            r.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            r.putProperty(Silencer.OWN_PROPERTY, id);
+            r.enable();
+            uncaught = r;
+        } catch (VMDisconnectedException e) {
+            // nothing left to stop
+        } catch (RuntimeException e) {
+            errors.add("watching for an uncaught throw: " + e);
+        }
+    }
+
+    private static boolean covers(ReferenceType declared, ReferenceType type) {
+        for (ReferenceType t = type; t != null; t = t instanceof ClassType c ? c.superclass() : null) {
+            if (declared == null || t.equals(declared)) return true;
+        }
+        return false;
+    }
+
+    private void deleteUncaught() {
+        EventRequest r = uncaught;
+        if (r == null) return;
+        uncaught = null;
+        try {
+            vm.eventRequestManager().deleteEventRequest(r);
+        } catch (VMDisconnectedException e) {
+            // it went with the VM
+        } catch (RuntimeException e) {
+            errors.add("deleting the uncaught-throw request: " + e);
+        }
     }
 
     /**
@@ -595,6 +662,11 @@ final class RealRunTrace {
         ObjectReference rec = keep(RecorderLoader.pin(() -> recorder.newInstance(thread, stepRecorder, List.of(log, vm.mirrorOf(step)), INVOKE)));
         ObjectReference wrapped = invoke(stream, "peek", rec);
         return sequentialize ? invoke(wrapped, "sequential") : wrapped;
+    }
+
+    private boolean isParallel(ObjectReference stream) throws Exception {
+        Method method = streamMethod(stream.referenceType(), "isParallel", 0);
+        return stream.invokeMethod(thread, method, List.of(), INVOKE) instanceof BooleanValue b && b.value();
     }
 
     private ObjectReference invoke(ObjectReference stream, String name, Value... arguments) throws Exception {
@@ -718,6 +790,17 @@ final class RealRunTrace {
                 }
             }
         }
+        ExceptionBreakpoints.traceEnded(vm);
+    }
+
+    /** Some of the user's breakpoints are switched off for the trace. */
+    boolean silencing() {
+        synchronized (silenceLock) {
+            for (Silencer s : silencers) {
+                if (s.size() > 0) return true;
+            }
+            return false;
+        }
     }
 
     /**
@@ -746,9 +829,11 @@ final class RealRunTrace {
     /** Worker: everything the trace holds, a parked thread the client never stepped out included. */
     private void dispose() {
         if (parked != null) {
-            if (stillParked()) resume(parked);
+            // A stop at an uncaught throw of the terminal's keeps the parked frames: resuming would end it behind java-debug.
+            if (!steppedOut && stillParked()) resume(parked);
             parked = null;
         }
+        deleteUncaught();
         teardown();
         for (ObjectReference o : pinned) {
             try {
@@ -984,6 +1069,8 @@ final class RealRunTrace {
         if (generation <= this.generation) {
             throw new Failure("stale", "collect needs a stop after the trace's, not generation " + generation);
         }
+        steppedOut = true;
+        deleteUncaught();
         handles.begin(generation);
         ToLongFunction<ObjectReference> handle = o -> {
             long objectId = o.uniqueID();
@@ -1008,7 +1095,7 @@ final class RealRunTrace {
         };
         int skipped = silencers.stream().mapToInt(Silencer::silencedBreakpoints).sum();
         return Values.json("records", records, "dropped", longOf(fields.get(field("dropped"))), "terminal", terminal,
-                "skippedBreakpoints", skipped, "sequentialized", plan.sequentialize());
+                "skippedBreakpoints", skipped, "sequentialized", sequentialized);
     }
 
     /**

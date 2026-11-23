@@ -5,7 +5,7 @@
  * Record / Value / Aggregates side panel following the selection.
  */
 import { writeClipboardText } from "@/platform/clipboard";
-import { useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useMemo, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import clsx from "clsx";
 import { Button, Checkbox, Icon, IconButton, Input, Popup, SearchField, Select, Tabs, T, type MenuItem } from "@/ui";
 import { EXPORT_FORMATS, exportData, type ExportData, type ExportFormat } from "./export";
@@ -36,7 +36,7 @@ import {
 } from "./jsonValue";
 import { JsonValueEditor, JsonValueWindow, type JsonEditorApi } from "./JsonValueEditor";
 import styles from "./Database.module.css";
-import { tx } from "@/platform/i18n";
+import { tx, txPart } from "@/platform/i18n";
 
 export type DataPanel = "record" | "value" | "aggregates";
 
@@ -46,7 +46,7 @@ export function exportMenu(data: ExportData, source: string, format?: ExportForm
     { label: "Export Data…", icon: "export", run: () => openDialog({ kind: "export", data, source, format }) },
     { kind: "separator" },
     ...EXPORT_FORMATS.map((f): MenuItem => ({
-      label: tx`Copy as ${f.label}`,
+      label: tx`Copy as ${txPart(f.label)}`,
       icon: "copy",
       run: () => void writeClipboardText(exportData(f.id, data)),
     })),
@@ -91,7 +91,17 @@ interface Shaping {
 
 export interface DataViewProps extends Pick<
   GridProps,
-  "rowState" | "isModified" | "editable" | "onEdit" | "onResetCell" | "driver" | "sort" | "onSort" | "rowMenu"
+  | "rowState"
+  | "isModified"
+  | "editable"
+  | "onEdit"
+  | "onResetCell"
+  | "driver"
+  | "sort"
+  | "onSort"
+  | "rowMenu"
+  | "initialScrollLeft"
+  | "onHorizontalScroll"
 > {
   columns: readonly GridColumn[];
   rowCount: number;
@@ -99,6 +109,7 @@ export interface DataViewProps extends Pick<
   /** Rows from here on (the table editor's added rows) are never filtered or sorted. */
   fixedRows?: number;
   firstRowNumber?: number;
+  pager?: ReactNode;
   /** The side panel shown (`null`: hidden). */
   panel: DataPanel | null;
   onPanelChange: (panel: DataPanel | null) => void;
@@ -237,6 +248,8 @@ export function DataView(props: DataViewProps) {
             onSelectionChange={setRange}
             onFilter={(col, anchor) => setFilterAt({ col, anchor })}
             filtered={(col) => filter.has(col)}
+            initialScrollLeft={props.initialScrollLeft}
+            onHorizontalScroll={props.onHorizontalScroll}
           />
           {filter.size > 0 && (
             <div className={styles.filterPill} role="status">
@@ -247,6 +260,7 @@ export function DataView(props: DataViewProps) {
             </div>
           )}
         </div>
+        {props.pager && <div className={styles.pagerDock}>{props.pager}</div>}
       </div>
       {filterAt && (
         <FilterPopup

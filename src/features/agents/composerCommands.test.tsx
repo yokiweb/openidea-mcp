@@ -67,7 +67,8 @@ import { defaultTaskProject } from "./project";
 import { HomeEditor } from "./HomeEditor";
 import chipStyles from "./ReferenceChip.module.css";
 import { setCaret, textOf, typeIn } from "./composerTesting";
-import { composerDraft, HOME, updateComposer, useAgents } from "./store";
+import { composerDraft, HOME, setDraftSkillOverrides, updateComposer, useAgents } from "./store";
+import { useSkillsCatalog } from "./skillsModel";
 import { emptyDraft } from "./composerModel";
 
 const command = (name: string, description: string, source: "command" | "skill" = "command"): AgentCommand => ({
@@ -180,6 +181,18 @@ describe("New Task composer commands", () => {
     fireEvent.keyDown(box, { key: "Enter" });
     expect(textOf(box)).toBe("");
     expect(await screen.findByText("Session MCP Servers")).toBeInTheDocument();
+  });
+
+  it("opens the per-session skills picker when /skills is completed in the composer", async () => {
+    agentCommands.mockResolvedValue({ status: "ok", data: [] });
+    render(<HomeEditor />);
+    const box = screen.getByRole("textbox");
+    typeIn(box, "/sk");
+    const list = await screen.findByRole("listbox", { name: "Commands" });
+    expect(within(list).getByRole("option", { selected: true })).toHaveTextContent("/skills");
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(textOf(box)).toBe("");
+    expect(await screen.findByText("Session Skills")).toBeInTheDocument();
   });
 
   it("names the icon-only Start action and disables it while starting", async () => {
@@ -298,6 +311,66 @@ describe("New Task composer commands", () => {
     await screen.findByRole("listbox", { name: "Commands" });
     fireEvent.keyDown(box, { key: "Enter" });
     expect(useAgents.getState().composers.get(HOME)?.text).toBe("fix the failing build /triage ");
+  });
+
+  it("completes a `!` command from earlier ones with Tab and runs it with Enter", async () => {
+    agentCommands.mockResolvedValue({ status: "ok", data: [] });
+    useAgents.setState({ history: ["!git status", "fix it"] });
+    render(<HomeEditor />);
+    await waitFor(() => expect(agentCommands).toHaveBeenCalled());
+    const box = screen.getByRole("textbox");
+    typeIn(box, "!gi");
+    expect(await screen.findByRole("option")).toHaveTextContent("git status");
+    fireEvent.keyDown(box, { key: "Tab" });
+    expect(textOf(box)).toBe("!git status");
+
+    typeIn(box, "!gi");
+    await screen.findByRole("option");
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => expect(agentCreate).toHaveBeenCalled());
+    expect(agentCreate.mock.calls[0]![0]).toMatchObject({ idle: true, prompt: { text: "!gi" } });
+  });
+
+  it("reflects per-session draft skillOverrides immediately in / completion", async () => {
+    agentCommands.mockResolvedValue({
+      status: "ok",
+      data: [command("triage", "Triage issues", "skill"), command("compact", "Compact")],
+    });
+    useSkillsCatalog.setState({
+      loaded: true,
+      skills: [
+        {
+          skill: {
+            name: "impeccable",
+            description: "Muted globally, enabled for this draft",
+            path: "/skills/impeccable",
+            source: "user",
+            valid: true,
+            warnings: [],
+          },
+          mode: "off",
+          origin: "user",
+        },
+      ],
+    });
+    render(<HomeEditor />);
+    await waitFor(() => expect(agentCommands).toHaveBeenCalled());
+
+    act(() => {
+      setDraftSkillOverrides({ triage: "off", impeccable: "auto" });
+    });
+
+    const box = screen.getByRole("textbox");
+    typeIn(box, "/");
+    const list = await screen.findByRole("listbox", { name: "Commands" });
+    await waitFor(() => {
+      const options = within(list)
+        .getAllByRole("option")
+        .map((o) => o.textContent);
+      expect(options.some((t) => t?.startsWith("/impeccable"))).toBe(true);
+      expect(options.some((t) => t?.startsWith("/triage"))).toBe(false);
+    });
+    useSkillsCatalog.setState({ skills: [], loaded: false });
   });
 });
 

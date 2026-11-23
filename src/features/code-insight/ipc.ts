@@ -1,4 +1,5 @@
 /** IPC helpers shared by the code-insight views. */
+import { openCodeLocation } from "@/editor/api";
 import type { EditorView } from "@codemirror/view";
 import { activeEditor, editorsFor, whenSynced } from "@/editor/api";
 import { isVirtualUri, virtualDocument } from "@/platform/virtualDocs";
@@ -134,7 +135,8 @@ export async function readManyFileLines(
 export async function withDocument<T>(path: string, fn: (doc: number) => Promise<T>): Promise<T> {
   const open = editorsFor(path)[0];
   if (open) return fn(open.ctx.doc);
-  const info = await lspRequest(() => commands.docOpen(path));
+  // Library types (`jdt://…`) are documents the language server provides, not files on disk.
+  const info = await lspRequest(() => (isVirtualUri(path) ? commands.docOpenVirtual(path) : commands.docOpen(path)));
   try {
     return await fn(info.id);
   } finally {
@@ -143,5 +145,5 @@ export async function withDocument<T>(path: string, fn: (doc: number) => Promise
 }
 
 export function openLocation(path: string, line: number, col: number): Promise<void> {
-  return maybeEditorService()?.openFile(path, { selection: { line, col }, focus: true }) ?? Promise.resolve();
+  return openCodeLocation(path, { line, col });
 }

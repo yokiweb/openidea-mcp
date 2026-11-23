@@ -7,16 +7,16 @@ export const HOME_KEY = "agent:new";
 export const TOOL_WINDOW = "agents";
 /** MIME of a dragged agent task (a tree row or the docked conversation bar): the payload is the task id. */
 export const TASK_DRAG = "application/x-openidea-agent-task";
-/** Settings › Agents › Coding Agents: the agents this machine runs. */
+/** Settings › Agents › Agent Setup. */
 export const REGISTRY_PAGE = "agents.list";
 /** The Settings folder holding the agent pages. */
 export const AGENTS_GROUP = "Agents";
-/** Settings › Agents › External MCP Servers: User and Workspace MCP configurations. */
+/** Settings › Agents › MCP Connections. */
 export const MCP_PAGE = "agents.mcpServers";
-/** Settings › Agents › Command Permissions. */
+/** Settings › Agents › Skills: every CLI's SKILL.md folders and their modes. */
+export const SKILLS_PAGE = "agents.skills";
+/** Settings › Agents › Command Rules. */
 export const POLICY_PAGE = "agents.policy";
-/** Settings › Agents › Working Status: the playful words under a working conversation. */
-export const WORKING_STATUS_PAGE = "agents.workingStatus";
 
 export const sessionKey = (task: string) => `agent:${task}`;
 
@@ -66,11 +66,25 @@ const PROVIDER_ICONS = new Set([
   "vibe",
   "omp",
   "deepseek-harness",
+  "hermes",
 ]);
 
-/** The agent's logo; custom agents get the generic agents icon. */
-export const providerIcon = (provider: string) =>
-  PROVIDER_ICONS.has(provider) ? `agent-${provider}` : "toolwindow-agents";
+/** Suggests an agent-file id for a display name (`"My Agent!"` → `"my-agent"`). */
+export function slugifyId(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** The agent a Hermes profile runs as: `hermes` for `default`, else `hermes-<slug>` (`hermes -p <name> acp`). */
+export const hermesAgentId = (profile: string) => (profile === "default" ? "hermes" : `hermes-${slugifyId(profile)}`);
+
+/** The agent's logo; custom agents get the generic agents icon, Hermes profiles Hermes'. */
+export function providerIcon(provider: string): string {
+  if (PROVIDER_ICONS.has(provider)) return `agent-${provider}`;
+  return provider.startsWith("hermes-") ? "agent-hermes" : "toolwindow-agents";
+}
 
 export interface TaskGroup {
   status: "needsInput" | "failed" | "limited" | "running" | "ready" | "archived";

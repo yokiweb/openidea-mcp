@@ -16,7 +16,8 @@ import { tx } from "@/platform/i18n";
 import { editorService, notifications, registerFontZoomSurface } from "@/workbench/contributions";
 import { OutputActivity } from "./activity";
 import { fitScheduler, settledResize } from "./fit";
-import { watchWindowsPty, windowsPty } from "./windowsPty";
+import { OutputGate, type TerminalMaxFps } from "./outputGate";
+import { watchWindowsPty, windowsPtyOptions } from "./windowsPty";
 import { installTerminalDrop } from "./drop";
 import { installDomRowCache } from "./domRowCache";
 import { installSelectionHighlights, type SelectionHighlightController } from "./highlight";
@@ -42,6 +43,9 @@ import {
   type TerminalFontSettings,
   MIN_CONTRAST_RATIO,
 } from "./theme";
+import { wheelZoomStep } from "@/platform/wheelZoom";
+
+export const ACTIVE_SEARCH_DECORATION_CLASS = "xterm-find-active-result-decoration";
 
 export interface TerminalSearchOptions {
   caseSensitive: boolean;
@@ -250,6 +254,8 @@ export class TerminalSession {
   private opened = false;
   /** `focus()` arrived before the textarea existed (the pane is focused while xterm is still closed). */
   private pendingFocus = false;
+  /** What had focus when `pendingFocus` was set: a later move elsewhere cancels it. */
+  private pendingFocusFrom: Element | null = null;
   /** Bounds retries when the pane has no box yet, or xterm cannot measure a cell. */
   private fitAttempts = 0;
   private disposed = false;
@@ -260,6 +266,11 @@ export class TerminalSession {
   /** Keystrokes typed while the PTY is still starting; sent as soon as it exists. */
   private pendingInput = "";
   private outputTail = "";
+  private readonly outputGate = new OutputGate({
+    maxFps: () => workflowSettings().terminal.maxFps as TerminalMaxFps,
+    hidden: () => typeof document !== "undefined" && document.hidden,
+    write: (data) => this.term.write(data),
+  });
   private lastSize = { cols: 0, rows: 0 };
   /** Per-tab font size offset (px) relative to `workflowSettings().terminal.fontSize`. */
   private fontZoom = 0;
@@ -310,7 +321,7 @@ export class TerminalSession {
     const settings = workflowSettings().terminal;
     const font = fontFor(settings);
     this.term = new Terminal({
-      windowsPty: windowsPty(),
+      ...windowsPtyOptions(),
       fontFamily: font.family,
       fontSize: font.size,
       lineHeight: font.lineHeight,
@@ -330,7 +341,7 @@ export class TerminalSession {
       minimumContrastRatio: MIN_CONTRAST_RATIO,
       smoothScrollDuration: 0,
       // Same width as the IDE's scrollbars (global.css); the slider is styled there too (Terminal.module.css).
-      overviewRuler: { width: 10 },
+      scrollbar: { width: 10 },
       theme: readTerminalTheme(),
       linkHandler: LINK_HANDLER,
     });
@@ -343,7 +354,7 @@ export class TerminalSession {
       const active = this.searchDecorations?.activeMatchBackground;
       const isActive = !!active && options.backgroundColor?.toLowerCase() === active.toLowerCase();
       const d = registerDecoration(isActive ? { ...options, layer: "top" } : options);
-      if (d && isActive) d.onRender((el) => el.classList.add("xterm-find-active-result-decoration"));
+      if (d && isActive) d.onRender((el) => el.classList.add(ACTIVE_SEARCH_DECORATION_CLASS));
       return d;
     };
     const runSearch =
@@ -464,10 +475,12 @@ export class TerminalSession {
   }
 
   private onWheelZoom = (e: WheelEvent) => {
-    if ((!e.ctrlKey && !e.metaKey) || e.deltaY === 0 || !editorPrefs().general.wheelZoom) return;
+    if (!editorPrefs().general.wheelZoom) return;
+    const zoom = wheelZoomStep(e);
+    if (zoom === null) return;
     e.preventDefault();
     e.stopPropagation();
-    this.stepFontSize(e.deltaY < 0 ? 1 : -1);
+    if (zoom) this.stepFontSize(zoom);
   };
 
   private onMiddleClick = (e: MouseEvent) => {
@@ -668,7 +681,17 @@ export class TerminalSession {
       this.opts.onFocus(this.key);
     });
     this.watchImeCommit();
-    if (this.pendingFocus) this.focus();
+    if (this.pendingFocus) {
+      this.pendingFocus = false;
+      if (this.focusStayedHere()) this.focus();
+    }
+  }
+
+  /** Whether focus is still where the deferred `focus()` left it, or in this terminal's own window. */
+  private focusStayedHere(): boolean {
+    const active = document.activeElement;
+    if (!active || active === document.body || active === this.pendingFocusFrom) return true;
+    return this.host.contains(active) || !!this.host.closest("[data-toolwindow]")?.contains(active);
   }
 
   detach(container: HTMLElement) {
@@ -742,7 +765,7 @@ export class TerminalSession {
     }
     this.outputTail = output.slice(output.length - held);
     output = output.slice(0, output.length - held);
-    if (output) this.term.write(output);
+    if (output) this.outputGate.push(output);
   }
 
   private doFit() {
@@ -782,6 +805,7 @@ export class TerminalSession {
     if (this.disposed || this.snapshot.status === "starting" || this.snapshot.status === "running") return;
     const generation = ++this.generation;
     this.outputTail = "";
+    this.outputGate.clear();
     this.resetActivity();
     const custom = this.opts.command;
     this.update({
@@ -978,6 +1002,7 @@ export class TerminalSession {
     this.clearUnseenDone();
     if (!this.opened || !this.term.textarea) {
       this.pendingFocus = true;
+      this.pendingFocusFrom = document.activeElement;
       this.scheduleFit();
       return;
     }
@@ -1041,6 +1066,7 @@ export class TerminalSession {
       this.opts.command?.onExit?.(null, true);
     this.fitter.cancel();
     this.ptyResize.cancel();
+    this.outputGate.dispose();
     if (this.activityTimer !== null) clearTimeout(this.activityTimer);
     this.pendingInput = "";
     this.resizeObserver?.disconnect();

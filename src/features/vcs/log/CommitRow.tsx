@@ -11,8 +11,10 @@ import { commitKey, commitRepo } from "../multiRoot";
 import { repoName, useVcs } from "../store";
 import { CommitMessage, RefLabels } from "./CommitMessage";
 import { GraphCell } from "./GraphCell";
+import { RowResizeHandle } from "./RowResizeHandle";
 import { commitMenu } from "./commitMenu";
 import { SUBJECT_COLUMN, columnSequence, type LogColumn } from "./shared";
+import { columnPrev } from "./useColumnResize";
 
 function CommitRowView({
   id,
@@ -20,10 +22,12 @@ function CommitRowView({
   fileHistoryTarget,
   graph,
   top,
+  height,
   selected,
   head,
   mine,
   onBranch,
+  outsideUnpicked,
   opts,
   remoteNames,
   onPick,
@@ -43,10 +47,12 @@ function CommitRowView({
   fileHistoryTarget: string | null;
   graph: GraphRow | undefined;
   top: number;
+  height: number;
   selected: boolean;
   head: boolean;
   mine: boolean;
   onBranch: boolean;
+  outsideUnpicked: boolean;
   opts: LogOptions;
   remoteNames: ReadonlySet<string>;
   onPick: (id: string, e: ReactMouseEvent) => void;
@@ -117,21 +123,29 @@ function CommitRowView({
         />
       )}
       {bookmarked && <Icon name="bookmark" size={12} />}
-      {opts.refsOnLeft && refs}
-      <span
-        ref={subjectRef}
-        className={clsx(styles.subject, head && styles.headSubject, merge && styles.mergeSubject)}
-        onPointerEnter={enterTooltip}
-        onPointerMove={enterTooltip}
-        onPointerLeave={leaveTooltip}
-        onPointerDown={() => {
-          clearTimeout(tooltipTimer.current);
-          setTooltip(false);
-        }}
-      >
-        <IssueText text={c.summary} />
+      <span className={styles.commitText}>
+        {opts.refsOnLeft && refs}
+        <span
+          ref={subjectRef}
+          className={clsx(
+            styles.subject,
+            head && styles.headSubject,
+            (merge || outsideUnpicked) && styles.mergeSubject,
+          )}
+          onPointerEnter={enterTooltip}
+          onPointerMove={enterTooltip}
+          onPointerLeave={leaveTooltip}
+          onPointerDown={() => {
+            clearTimeout(tooltipTimer.current);
+            setTooltip(false);
+          }}
+        >
+          <span className={styles.subjectText}>
+            <IssueText text={c.summary} />
+          </span>
+        </span>
+        {!opts.refsOnLeft && refs}
       </span>
-      {!opts.refsOnLeft && refs}
       <Popup
         open={tooltip}
         anchor={subjectRef}
@@ -152,8 +166,13 @@ function CommitRowView({
       id={id}
       role="option"
       aria-selected={selected}
-      className={clsx(styles.row, onBranch && styles.currentBranch, selected && styles.selected)}
-      style={{ top }}
+      className={clsx(
+        styles.row,
+        onBranch && styles.currentBranch,
+        selected && styles.selected,
+        opts.showColumnDividers && styles.showDividers,
+      )}
+      style={{ top, height }}
       onMouseDown={(e) => {
         if (e.shiftKey) e.preventDefault(); // no text selection on range clicks
         onPick(commitKey(c), e);
@@ -168,10 +187,11 @@ function CommitRowView({
           {repoName(commitRepo(c)!)}
         </span>
       )}
-      {columnSequence(opts.columnOrder, columns).map((cid) => {
+      {columnSequence(opts.columnOrder, columns).map((cid, _index, ids) => {
         if (cid === SUBJECT_COLUMN.id) return subjectCell;
         const column = columns.find((col) => col.id === cid);
         if (!column) return null;
+        const width = opts.columnWidths[column.id] ?? column.width ?? 120;
         return (
           <span
             key={cid}
@@ -181,10 +201,11 @@ function CommitRowView({
               column.id === "author" && mine && styles.mine,
               column.id === "hash" && styles.hash,
             )}
-            style={{ width: opts.columnWidths[column.id] ?? column.width ?? 120 }}
+            style={{ width }}
             title={column.id === "author" ? `${c.author} <${c.email}>` : undefined}
           >
             {column.render(c)}
+            <RowResizeHandle target={{ id: column.id, width, ...columnPrev(ids, column.id, opts, columns) }} />
           </span>
         );
       })}

@@ -3,6 +3,7 @@ import { parseArgs, formatArgs } from "@/platform/commandLine";
 import { workflowSettings } from "@/platform/workflowSettings";
 import { call, commands, type LaunchConfig, type RunConfig } from "@/platform/ipc";
 import { hostOs } from "@/platform/remote";
+import { flutterDeviceFor, parseFlutterRun } from "@/workbench/flutterDevices";
 
 function isAbsolute(p: string) {
   return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p);
@@ -76,7 +77,7 @@ function cargoLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfig 
   };
 }
 
-const PYTHON_NAME = /^python[\d.]*(\.exe)?$/;
+const PYTHON_NAME = /^python[\d.]*(\.exe)?$/i;
 
 /** `python` on Windows (`python3` is at most a Store alias there, and venvs have no `python3.exe`), `python3` elsewhere. */
 function systemPython(): string {
@@ -85,10 +86,10 @@ function systemPython(): string {
 
 function pythonFor(rc: RunConfig, cwd: string): string {
   const cmd = rc.command;
-  const name = cmd.split("/").pop() ?? cmd;
-  if (PYTHON_NAME.test(name)) return resolveCommand(cmd, cwd);
-  // A venv tool such as `.venv/bin/pytest`: use the interpreter next to it.
-  if (cmd.includes("/")) return resolveCommand(cmd.slice(0, cmd.lastIndexOf("/") + 1) + "python", cwd);
+  if (PYTHON_NAME.test(commandName(cmd))) return resolveCommand(cmd, cwd);
+  // A venv tool such as `.venv/bin/pytest` or `.venv\Scripts\pytest.exe`: use the interpreter next to it.
+  const dir = cmd.slice(0, Math.max(cmd.lastIndexOf("/"), cmd.lastIndexOf("\\")) + 1);
+  if (dir) return resolveCommand(dir + (hostOs() === "windows" ? "python.exe" : "python"), cwd);
   return systemPython();
 }
 
@@ -107,7 +108,7 @@ function debugpyLaunch(rc: RunConfig, cwd: string): LaunchConfig {
     subProcess: dbg.python.attachSubprocess,
   };
   if (dbg.python.gevent) extra.gevent = true;
-  const name = (rc.command.split("/").pop() ?? rc.command).replace(/\.exe$/, "");
+  const name = commandName(rc.command);
   let args = rc.args;
   let tool: string | null = PYTHON_NAME.test(name) ? null : name;
   if (PYTHON_RUNNERS.has(name) && args[0] === "run" && args[1]) {
@@ -372,13 +373,21 @@ function nativeLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfig
  * entry point (`lib/main.dart`) — never the interpreter named by `command`.
  */
 function flutterLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfig {
-  // A file-scoped config carries the entry point as its last `.dart` argument
-  // (`dart run lib/main.dart`); a user config may name none, which is the
-  // conventional Flutter entry point.
-  const entry = [...rc.args].reverse().find((a) => a.endsWith(".dart")) ?? "lib/main.dart";
+  // A Flutter configuration names its entry point with `--target`; a file-scoped one carries
+  // it as its last `.dart` argument (`dart run lib/main.dart`). Either may name none, which
+  // is the conventional Flutter entry point.
+  const run = rc.kind === "flutter" ? parseFlutterRun(rc.args) : null;
+  const named = run ? run.entry : [...rc.args].reverse().find((a) => a.endsWith(".dart"));
+  const entry = named ?? "lib/main.dart";
+  const toolArgs = run?.rest ?? [];
+  const device = flutterDeviceFor(rc);
+  // `__flutterDevice` becomes `-d` only if the backend finds this is a Flutter project: the
+  // same adapter debugs plain Dart programs.
+  const extra = { ...(toolArgs.length ? { toolArgs } : {}), ...(device ? { __flutterDevice: device } : {}) };
   return {
     ...base(rc, adapter, cwd),
     program: join(cwd, entry),
+    extraJson: Object.keys(extra).length ? JSON.stringify(extra) : null,
   };
 }
 
@@ -389,12 +398,12 @@ function flutterLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfi
  *
  * `params.vm-service-uri` pins the VM Service endpoint (`flutter attach
  * --debug-uri`); without it `flutter attach` discovers the running app on the
- * device. `params.device` becomes `-d <device>`.
+ * device. `params.device`, else the toolbar's device, becomes `-d <device>`.
  */
 function flutterAttach(rc: RunConfig, cwd: string, adapter: string): LaunchConfig {
   const p = rc.params ?? {};
   const uri = p["vm-service-uri"] || p.vmServiceUri;
-  const device = p.device;
+  const device = flutterDeviceFor(rc);
   // `__flutter` tells the adapter launcher to use `flutter debug_adapter`
   // whatever the working directory holds (an add-to-app module lives below a
   // workspace root that has no Flutter dependency of its own). It is removed

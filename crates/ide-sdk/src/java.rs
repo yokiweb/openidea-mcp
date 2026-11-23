@@ -53,6 +53,12 @@ struct JavaProbe {
 
 static JAVA_PROBES: Mutex<BTreeMap<PathBuf, JavaProbe>> = Mutex::new(BTreeMap::new());
 
+/// How long `java -version` may take before the JDK counts as unable to run. The first
+/// run of a JDK can be slow: Rosetta translates an x86_64 JDK on Apple silicon, and
+/// malware scans check a freshly downloaded one. Excluded, a project's JDK 8 leaves its
+/// `JavaSE-1.8` to a newer JDK, and APIs JDK 8 has (`jdk.nashorn`) stop resolving.
+const JAVA_PROBE_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(8) } else { Duration::from_secs(30) };
+
 /// Metadata can describe a JDK built for another architecture. Probe the executable
 /// before giving it to JDT, with a short cache shared by server and project selection.
 pub(crate) fn java_runs(java: &Path) -> bool {
@@ -72,12 +78,17 @@ pub(crate) fn java_runs(java: &Path) -> bool {
             return probe.runnable;
         }
     }
-    let runnable = crate::exec::query(java, &["-version"], Duration::from_secs(5)).is_some();
+    let runnable = crate::exec::query(java, &["-version"], JAVA_PROBE_TIMEOUT).is_some();
     JAVA_PROBES.lock().unwrap_or_else(|e| e.into_inner()).insert(
         java.to_path_buf(),
         JavaProbe { modified, len: metadata.len(), permissions: metadata.permissions(), at: Instant::now(), runnable },
     );
     runnable
+}
+
+/// First runnable Java installation in discovery order, including standalone JREs.
+pub fn java_runtime(jdks: &[Jdk], min_java: u32) -> Option<&Jdk> {
+    jdks.iter().find(|j| j.major >= min_java && java_runs(&java_executable(&j.home)))
 }
 
 fn project_jdk_is_usable(jdk: &Jdk) -> bool {
@@ -742,6 +753,16 @@ pub(crate) fn write_test_java(home: &Path) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn java_runtime_accepts_a_jre_without_a_compiler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jre = test_jdk(tmp.path(), 17, "jre");
+        std::fs::remove_file(jre.home.join("bin").join(crate::exe("javac"))).unwrap();
+        let jdks = [test_jdk(tmp.path(), 11, "old"), jre.clone()];
+        assert_eq!(java_runtime(&jdks, 17), Some(&jre));
+        assert_eq!(java_runtime(&jdks, 21), None);
+    }
+
     fn test_jdk(root: &Path, major: u32, name: &str) -> Jdk {
         let home = root.join(name.trim_start_matches('/'));
         std::fs::create_dir_all(home.join("bin")).unwrap();
@@ -978,6 +999,26 @@ mod tests {
         assert!(java_runs(&java), "a JDK that ran stays usable");
         assert!(java_execution_error(&java).is_none());
         assert_eq!(std::fs::read_to_string(&probes).unwrap().lines().count(), 1, "probed once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_jdk_8_slow_on_its_first_run_stays_the_java_8_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jdk8 = test_jdk(tmp.path(), 8, "rosetta8");
+        let jdk25 = test_jdk(tmp.path(), 25, "native25");
+        // Longer than the 5 seconds a first run under Rosetta used to be allowed.
+        std::fs::write(
+            java_executable(&jdk8.home),
+            "#!/bin/sh
+/bin/sleep 6
+echo 'openjdk version 1.8'
+",
+        )
+        .unwrap();
+        let rt = runtimes(&[jdk8.clone(), jdk25.clone()]);
+        assert_eq!(rt[0], json!({ "name": "JavaSE-1.8", "path": jdk8.home }));
+        assert_eq!(rt[1]["name"], "JavaSE-25");
     }
 
     #[cfg(unix)]
@@ -1588,8 +1629,18 @@ pub fn usages_bundle(data_dir: &Path) -> Option<PathBuf> {
     install_bundle(
         data_dir,
         "java-usages",
-        "1.15.0",
+        "1.17.0",
         include_bytes!("../../../java/java-usages/openidea-java-usages.jar"),
+    )
+}
+
+/// Extracts the JDBC bridge into the application's data directory.
+pub fn jdbc_bridge_jar(data_dir: &Path) -> Option<PathBuf> {
+    install_bundle(
+        data_dir,
+        "jdbc-bridge",
+        "1.0.0",
+        include_bytes!("../../../java/jdbc-bridge/openidea-jdbc-bridge.jar"),
     )
 }
 
@@ -1598,7 +1649,7 @@ pub fn jvm_inspect_bundle(data_dir: &Path) -> Option<PathBuf> {
     install_bundle(
         data_dir,
         "jvm-inspect",
-        "1.1.0",
+        "1.2.0",
         include_bytes!("../../../java/jvm-inspect/openidea-jvm-inspect.jar"),
     )
 }
@@ -1694,7 +1745,7 @@ mod usages_bundle_tests {
             std::fs::write(dir.path().join(name), b"old").unwrap();
         }
         let jar = super::jvm_inspect_bundle(dir.path()).unwrap();
-        assert_eq!(jar, dir.path().join("jvm-inspect-1.1.0.jar"));
+        assert_eq!(jar, dir.path().join("jvm-inspect-1.2.0.jar"));
         assert_eq!(std::fs::read(&jar).unwrap(), include_bytes!("../../../java/jvm-inspect/openidea-jvm-inspect.jar"));
         assert!(!dir.path().join("jvm-inspect-0.9.0.jar").exists());
         assert_eq!(std::fs::read(dir.path().join("java-usages-1.7.0.jar")).unwrap(), b"old");

@@ -3,7 +3,14 @@
  * changes about to be committed and writes their message. It runs as a short task that
  * is deleted once the message is in the commit field.
  */
-import type { AgentConfigChoice, AgentConfigOption, AgentEntry, AgentProvider, AgentTask } from "@/bindings";
+import type {
+  AgentConfigChoice,
+  AgentConfigOption,
+  AgentEntry,
+  AgentModelCatalog,
+  AgentProvider,
+  AgentTask,
+} from "@/bindings";
 import { executeAction } from "@/platform/actions";
 import { tx } from "@/platform/i18n";
 import { call, commands } from "@/platform/ipc";
@@ -44,7 +51,12 @@ export function fitPatch(patch: string, budget = PATCH_BUDGET, perFile = FILE_BU
   return omitted.length ? `${out}\nDiff omitted for: ${omitted.join(", ")}\n` : out;
 }
 
-export function commitMessagePrompt(patch: string, subjectLimit: number, recentSubjects: readonly string[]): string {
+export function commitMessagePrompt(
+  patch: string,
+  subjectLimit: number,
+  recentSubjects: readonly string[],
+  instructions = "",
+): string {
   const lines = [
     "Write a commit message",
     "",
@@ -54,6 +66,8 @@ export function commitMessagePrompt(patch: string, subjectLimit: number, recentS
     "- Don't edit files or run commands. The whole diff is below.",
     "- Reply with the commit message only: no quotes, no code fence, no commentary.",
   ];
+  // The project's own conventions (Settings › Version Control › Commit) come before the style of recent commits.
+  if (instructions.trim()) lines.push("", "Follow these conventions for commit messages here:", instructions.trim());
   if (recentSubjects.length) {
     lines.push(
       "",
@@ -107,7 +121,7 @@ function modelChoice(options: readonly AgentConfigOption[]): AgentConfigChoice[]
 }
 
 /**
- * The settings that make the agent ask before it edits or runs anything. New tasks start
+ * The settings that keep the agent read-only, or else make it ask before it edits or runs anything. New tasks start
  * in the mode that approves everything unless the user chose otherwise, and the changes
  * the agent reads here are text from the repository: they must not be able to run commands.
  */
@@ -116,7 +130,10 @@ export function askingChoices(options: readonly AgentConfigOption[]): AgentConfi
   const mode = modeOption(options);
   if (mode) {
     const asking = mode.values.filter((v) => ["lock", "eye"].includes(modeIcon(v.value)));
-    const value = ["default", "ask"].map((p) => asking.find((v) => v.value === p)).find(Boolean) ?? asking[0];
+    const value =
+      asking.find((v) => /read-?only/i.test(v.value)) ??
+      ["default", "ask"].map((p) => asking.find((v) => v.value === p)).find(Boolean) ??
+      asking[0];
     if (value) out.push({ id: mode.id, value: value.value });
   }
   const permissions = options.find((o) => o.category === "permissions");
@@ -129,26 +146,72 @@ export function askingChoices(options: readonly AgentConfigOption[]): AgentConfi
 
 const choicesFor = (options: readonly AgentConfigOption[]) => [...modelChoice(options), ...askingChoices(options)];
 
+/** Settings › Version Control › Commit: the agent, model and thinking level to generate with; empty follows the agent. */
+export interface CommitAgentPreference {
+  agent: string;
+  agentModel: string;
+  agentEffort: string;
+}
+
+type ModelCatalog = Pick<AgentModelCatalog, "config" | "thoughtLevels">;
+
 /**
  * The agent that wrote the code: the one of the project's latest task, on the model it
- * ran with. Without a task, the one the New Task page has selected.
+ * ran with. Without a task, the one the New Task page has selected. An agent chosen in
+ * the settings replaces it, on the model and thinking level chosen there when it offers them.
  */
 export function pickAgent(
   tasks: Iterable<AgentTask>,
   providers: readonly AgentProvider[],
   draft: Draft,
+  preference?: CommitAgentPreference,
+  catalogs?: ReadonlyMap<string, ModelCatalog>,
 ): CommitAgent | null {
   const installed = providers.filter((p) => p.installed);
+  const chosen = preference?.agent ? installed.find((p) => p.id === preference.agent) : undefined;
+  const candidates = chosen ? [chosen] : installed;
   const latest = [...tasks]
-    .filter((t) => t.status !== "archived" && installed.some((p) => p.id === t.provider))
+    .filter((t) => t.status !== "archived" && candidates.some((p) => p.id === t.provider))
     .sort((a, b) => (b.updatedMs ?? 0) - (a.updatedMs ?? 0))[0];
-  if (latest) return { provider: latest.provider, config: choicesFor(latest.config) };
-  const provider = installed.find((p) => p.id === draft.provider) ?? installed[0];
+  const provider = latest
+    ? installed.find((p) => p.id === latest.provider)!
+    : (chosen ?? installed.find((p) => p.id === draft.provider) ?? installed[0]);
   if (!provider) return null;
+  const options = latest
+    ? latest.config
+    : provider.id === draft.provider
+      ? draftConfig(provider, draft)
+      : provider.config;
+  if (!chosen || !preference || (!preference.agentModel && !preference.agentEffort)) {
+    return { provider: provider.id, config: choicesFor(options) };
+  }
   return {
     provider: provider.id,
-    config: choicesFor(provider.id === draft.provider ? draftConfig(provider, draft) : provider.config),
+    config: [...preferredModel(options, provider, preference, catalogs?.get(provider.id)), ...askingChoices(options)],
   };
+}
+
+/** The model and thinking level of `preference` that the agent offers, else the ones it would run with. */
+function preferredModel(
+  options: readonly AgentConfigOption[],
+  provider: AgentProvider,
+  preference: CommitAgentPreference,
+  catalog: ModelCatalog | undefined,
+): AgentConfigChoice[] {
+  const offered = (catalog?.config ?? provider.config).find((o) => o.category === "model");
+  const fallback = modelChoice(options);
+  const model =
+    offered && preference.agentModel && offered.values.some((v) => v.value === preference.agentModel)
+      ? { id: offered.id, value: preference.agentModel }
+      : fallback[0];
+  if (!model) return [];
+  const levels = (catalog?.thoughtLevels ?? provider.thoughtLevels)?.[model.value] ?? [];
+  const level = levels.find((o) => o.category === "thought_level");
+  const effort =
+    level && preference.agentEffort && level.values.some((v) => v.value === preference.agentEffort)
+      ? [{ id: level.id, value: preference.agentEffort }]
+      : [];
+  return [model, ...effort];
 }
 
 /** Resolves when the task's turn ends; rejects when it can't produce an answer. */
@@ -233,8 +296,9 @@ async function generate(): Promise<void> {
     notify({ level: "info", title: "No changes to describe", body: "Include changes in the commit first." });
     return;
   }
-  const { tasks, providers, draft } = useAgents.getState();
-  const agent = pickAgent(tasks.values(), providers, draft);
+  const { commit } = workflowSettings().vcs;
+  const { tasks, providers, draft, modelCatalogs } = useAgents.getState();
+  const agent = pickAgent(tasks.values(), providers, draft, commit, modelCatalogs);
   if (!agent) {
     notify({
       level: "warning",
@@ -245,9 +309,13 @@ async function generate(): Promise<void> {
     return;
   }
 
-  const { commit } = workflowSettings().vcs;
   const subjects = await recentSubjects(changes.roots[0]);
-  const prompt = commitMessagePrompt(changes.patch, commit.limitSubject ? commit.subjectLimit : 72, subjects);
+  const prompt = commitMessagePrompt(
+    changes.patch,
+    commit.limitSubject ? commit.subjectLimit : 72,
+    subjects,
+    commit.agentInstructions,
+  );
   let task: AgentTask | undefined;
   let release = () => {};
   try {
@@ -270,7 +338,15 @@ async function generate(): Promise<void> {
     await turnEnd(created.id);
     const message = commitMessageOf(replyOf(await call(commands.agentEntries(created.id, null))));
     if (!message) throw new Error(tx("The agent did not reply with a commit message"));
-    if (!service.setMessage(changes.revision, message)) {
+    // The files may have been edited since without touching the draft: the message must
+    // still describe what would be committed.
+    const unchanged = async () => {
+      if (service.revision() !== changes.revision) return null;
+      const now = await service.changes().catch(() => null);
+      return now && now.patch === changes.patch ? now.revision : null;
+    };
+    const at = await unchanged();
+    if (at === null || !service.setMessage(at, message)) {
       notify({
         level: "info",
         title: "Commit message not replaced",

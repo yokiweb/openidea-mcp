@@ -226,6 +226,19 @@ async fn password_authentication_and_forwarding() {
 }
 
 #[tokio::test]
+async fn command_tunnel_runs_the_command_per_connection() {
+    let env = env().await;
+    let session = Arc::new(env.connect_trusted(&env.target(SshAuth::Password), Some("secret")).await.ok().unwrap());
+    let tunnel = Tunnel::command(session, "docker system dial-stdio").await.unwrap();
+    for _ in 0..2 {
+        let mut s = TcpStream::connect(("127.0.0.1", tunnel.port())).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "ran: docker system dial-stdio");
+    }
+}
+
+#[tokio::test]
 async fn forwarding_keeps_the_port_number_when_it_is_free() {
     let env = env().await;
     let target = env.target(SshAuth::Password);
@@ -257,6 +270,36 @@ async fn dropping_a_tunnel_closes_active_connections() {
         0
     );
     assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn closing_a_tunnel_lets_go_of_the_session_and_its_connections() {
+    let env = env().await;
+    let session = Arc::new(env.connect_trusted(&env.target(SshAuth::Password), Some("secret")).await.ok().unwrap());
+    let tunnel = Tunnel::listen(session.clone(), "127.0.0.1", env.echo_port).await.unwrap();
+    let port = tunnel.port();
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    socket.write_all(b"ping").await.unwrap();
+    let mut reply = [0; 4];
+    socket.read_exact(&mut reply).await.unwrap();
+    assert!(Arc::strong_count(&session) > 2, "the tunnel and its connection hold the session");
+
+    tunnel.close().await;
+    // Nothing is left behind to wait for: only this test holds the session now.
+    assert_eq!(Arc::strong_count(&session), 1);
+    let mut byte = [0];
+    assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn closing_an_idle_tunnel_returns_at_once() {
+    let env = env().await;
+    let session = Arc::new(env.connect_trusted(&env.target(SshAuth::Password), Some("secret")).await.ok().unwrap());
+    let tunnel = Tunnel::command(session.clone(), "docker system dial-stdio").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.close()).await.unwrap();
+    assert_eq!(Arc::strong_count(&session), 1);
 }
 
 #[tokio::test]

@@ -322,9 +322,10 @@ export function AgentsView() {
           })
         }
         selected={selected}
-        onSelectionChange={(sel, lead) => {
+        onSelectionChange={(sel, lead, reason) => {
           setSelected(sel);
-          if (!inline && sel.size === 1 && lead?.kind === "task" && sel.has(lead.task.id)) showTask(lead.task.id);
+          if (reason !== "contextMenu" && !inline && sel.size === 1 && lead?.kind === "task" && sel.has(lead.task.id))
+            showTask(lead.task.id);
         }}
         onActivate={(n) => n.kind === "task" && showTask(n.task.id)}
         onContextMenu={(n, sel, e) => {
@@ -411,7 +412,7 @@ export function AgentsView() {
               {/* Docked, the list shows in the history popup, which lists the sessions itself. */}
               {!inline && (
                 <button type="button" className={styles.link} onClick={showImportSessions}>
-                  <T>Import Sessions from Other Apps…</T>
+                  <T>Import Sessions…</T>
                 </button>
               )}
             </div>

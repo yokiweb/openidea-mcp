@@ -38,7 +38,7 @@ import {
   DB_TOOL_WINDOW,
   RESULTS_VIEW,
   consoleSource,
-  consoleTints,
+  consoleDecorations,
   inEditorResults,
   setInEditorResults,
   loadSources,
@@ -81,8 +81,6 @@ function tableTarget(arg: unknown): TableCommandTarget {
   return { rows: activeCellGrid()?.selectedRows() ?? [], editor: null };
 }
 
-export { activateSettingsPages } from "./settingsPages";
-
 export function activate(): () => void {
   const disposers = [
     onIdeEvent("dbSourcesChanged", () => {
@@ -111,6 +109,8 @@ export function activate(): () => void {
       component: lazyComponent(() => import("./TableEditor").then((m) => m.TableEditor)),
       title: tableTitle,
       icon: () => "database",
+      // Switching tabs keeps the rows, filters, page and unsubmitted edits without querying again.
+      keepAlive: true,
     }),
     registerOverlay({
       id: "database.dialogs",
@@ -157,13 +157,14 @@ export function activate(): () => void {
         manualCommit: new Set(),
         pendingTx: new Set(),
         running: {},
+        executions: {},
         dialog: null,
         newMenuOpen: false,
       });
     }),
-    // Consoles of coloured data sources get a tinted tab.
     useDatabase.subscribe((s, prev) => {
-      if (s.consoles !== prev.consoles || s.sources !== prev.sources) setFileDecorations("database", consoleTints(s));
+      if (s.consoles !== prev.consoles || s.sources !== prev.sources)
+        setFileDecorations("database", consoleDecorations(s));
     }),
     () => setFileDecorations("database", new Map()),
     watchIdleConnections(),
@@ -353,6 +354,7 @@ export function activate(): () => void {
         icon: "db-plan",
         keywords: ["query plan", "explain", "sql"],
         when: `editorTextFocus && editorLangId == ${SQL_LANGUAGE}`,
+        enabled: () => sourceById(consoleSource(activeEditor()?.ctx.path ?? ""))?.driver !== "jdbc",
         run: async () => {
           const current = projectRequest();
           const e = activeEditor();

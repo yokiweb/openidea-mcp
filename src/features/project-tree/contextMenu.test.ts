@@ -1,5 +1,5 @@
 import { clearContext, setContext } from "@/platform/context";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerActions } from "@/platform/actions";
 import { useProject } from "@/platform/project";
 import { useRemote } from "@/platform/remote";
@@ -8,6 +8,11 @@ import { registerMenuGroup } from "@/workbench/contributions";
 import { contextMenuItems, keyLabel, revealLabel } from "./contextMenu";
 import type { ProjectNode } from "./model";
 import { useProjectTree } from "./store";
+
+vi.mock("@/platform/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/platform/ipc")>()),
+  isTauri: () => true,
+}));
 
 const ROOT = "/p";
 const SCRATCHES = "/config/scratches";
@@ -110,6 +115,17 @@ describe("project view context menu", () => {
     }
   });
 
+  it("passes the selected Project view directory to Commit…", () => {
+    const items = contextMenuItems([node("/p/module", true)]);
+    const git = items.find((item) => item.kind !== "separator" && item.kind !== "header" && item.label === "Git");
+    const commit =
+      git && "submenu" in git
+        ? git.submenu?.find((item) => item.kind !== "separator" && item.kind !== "header" && item.label === "Commit…")
+        : undefined;
+
+    expect(commit).toMatchObject({ kind: "action", action: "vcs.commit", arg: "/p/module" });
+  });
+
   it("lists contributed links in Copy Path/Reference…", () => {
     disposers.push(
       registerMenuGroup({
@@ -129,7 +145,7 @@ describe("project view context menu", () => {
     ]);
   });
 
-  it("follows IDEA's order for a file", () => {
+  it("groups clipboard, search, file changes, formatting and history actions for a file", () => {
     const items = contextMenuItems([node(`${ROOT}/src/a.py`)]);
     expect(labels(items)).toEqual([
       "New",
@@ -138,17 +154,18 @@ describe("project view context menu", () => {
       "Copy",
       "Copy Path/Reference…",
       "Paste",
-      "-",
       "Jump to Source",
+      "-",
       "Find Usages",
       "Find in Files…",
       "Replace in Files…",
       "-",
+      "Rename…",
       "Refactor",
+      "Delete…",
       "-",
       "Reformat Code",
       "Optimize Imports",
-      "Delete…",
       "-",
       "Run 'a'",
       "-",
@@ -156,11 +173,11 @@ describe("project view context menu", () => {
       "Open In",
       "-",
       "Local History",
+      "Git",
       "Reload from Disk",
       "-",
-      "Git",
-      "-",
       "Compare With…",
+      "-",
       "File Color",
     ]);
     expect(sub(items, "Refactor")).toEqual(["Rename…", "Move File…", "Copy File…", "-", "Safe Delete…"]);
@@ -175,7 +192,7 @@ describe("project view context menu", () => {
       "-",
       "Edit File Colors…",
     ]);
-    expect(sub(items, "Open In")).toEqual([revealLabel(), "Terminal"]);
+    expect(sub(items, "Open In")).toEqual([revealLabel(), "Associated Application", "Terminal"]);
     expect(sub(items, "Git")?.slice(0, 4)).toEqual(["Commit File…", "Add", "-", "Annotate with Git Blame"]);
   });
 
@@ -199,7 +216,7 @@ describe("project view context menu", () => {
 
   it("hides the OS file manager in an SSH or dev-container window, whose files are not on this desktop", () => {
     const library = { ...node("/root/.m2/lib.jar"), readOnly: true };
-    expect(sub(contextMenuItems([library]), "Open In")).toEqual([revealLabel()]);
+    expect(sub(contextMenuItems([library]), "Open In")).toEqual([revealLabel(), "Associated Application"]);
     for (const target of [
       { kind: "ssh", config: "box" },
       { kind: "devContainer", folder: "/Users/me/app", config: "" },
@@ -207,6 +224,22 @@ describe("project view context menu", () => {
       useRemote.setState({ session: { target, root: ROOT, host: "h", os: "linux", commands: [] } });
       expect(sub(contextMenuItems([node(`${ROOT}/src/a.py`)]), "Open In")).toEqual(["Terminal"]);
       expect(labels(contextMenuItems([library]))).not.toContain("Open In");
+    }
+  });
+
+  it("offers Download to… for remote project files only (#4718)", () => {
+    const off = registerActions([{ id: "project.downloadTo", title: "Download to…", run: () => undefined }]);
+    try {
+      const files = [node(`${ROOT}/src`, true), node(`${ROOT}/a.py`)];
+      expect(labels(contextMenuItems(files))).not.toContain("Download to…");
+      useRemote.setState({
+        session: { target: { kind: "ssh", config: "box" }, root: ROOT, host: "h", os: "linux", commands: [] },
+      });
+      const l = labels(contextMenuItems(files));
+      expect(l.indexOf("Download to…")).toBe(l.indexOf("Open In") + 1);
+      expect(labels(contextMenuItems([node(`${SCRATCHES}/s.py`)]))).not.toContain("Download to…");
+    } finally {
+      off();
     }
   });
 
@@ -249,7 +282,8 @@ describe("project view context menu", () => {
 
   it("shows Mark Directory as for folders, without file-only items", () => {
     const l = labels(contextMenuItems([node(`${ROOT}/src`, true)]));
-    expect(l).toContain("Mark Directory as");
+    expect(l.slice(l.indexOf("Rename…"), l.indexOf("Rename…") + 4)).toEqual(["Rename…", "Refactor", "Delete…", "-"]);
+    expect(l.slice(-4)).toEqual(["Compare With…", "-", "Mark Directory as", "File Color"]);
     expect(sub(contextMenuItems([node(`${ROOT}/src`, true)]), "Refactor")).toContain("Move Directory…");
     for (const fileOnly of ["Find Usages", "Optimize Imports", "Run 'a'", "Open in Right Split"])
       expect(l).not.toContain(fileOnly);
@@ -301,6 +335,7 @@ describe("project view context menu", () => {
   it("keeps the project root menu short and disables what cannot apply", () => {
     const items = contextMenuItems([node(ROOT, true, true)]);
     const l = labels(items);
+    expect(l).not.toContain("Rename…");
     expect(l).not.toContain("Refactor");
     expect(l).not.toContain("Mark Directory as");
     const resolved = resolveMenuItems(items);
@@ -318,6 +353,7 @@ describe("project view context menu", () => {
 
   it("offers Compare Files for two files", () => {
     const l = labels(contextMenuItems([node(`${ROOT}/a.py`), node(`${ROOT}/b.py`)]));
+    expect(l).not.toContain("Rename…");
     expect(l).toContain("Compare Files");
     expect(l).not.toContain("Compare With…");
   });

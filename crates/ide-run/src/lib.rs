@@ -182,6 +182,12 @@ pub struct RunExtras {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[specta(optional)]
     pub target: Option<String>,
+    /// The test framework a test configuration runs when detection recognised one that the
+    /// command line doesn't name (a `package.json` script running `playwright test`): picks the
+    /// test output parser and how a single test is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub test_runner: Option<String>,
 }
 
 impl Default for RunExtras {
@@ -205,6 +211,7 @@ impl Default for RunExtras {
             emulate_terminal: false,
             stop_command: None,
             target: None,
+            test_runner: None,
         }
     }
 }
@@ -258,6 +265,11 @@ pub fn detect_with_profiles(
     detect::detect_with_profiles(root, excluded_poms, profiles)
 }
 
+/// Configurations of the Maven / Gradle builds a user linked in `dirs`, at any depth below `root` or outside it.
+pub fn detect_builds(root: &Path, dirs: &[PathBuf]) -> Vec<RunConfig> {
+    detect::detect_builds(root, dirs)
+}
+
 /// Reads `<root>/.openidea/run.toml`; a missing file yields no configs.
 pub fn load_user_configs(root: &Path) -> IdeResult<Vec<RunConfig>> {
     config::load(root)
@@ -295,7 +307,17 @@ pub fn save_templates(root: &Path, templates: &[RunConfig]) -> IdeResult<()> {
 
 /// The environment runs inherit (unless "Include system environment variables" is off).
 pub fn system_env() -> BTreeMap<String, String> {
-    ide_core::process::host_vars().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
+    strings(ide_core::process::host_vars())
+}
+
+/// [`system_env`] of a run in the project at `root`: the project's environment (its direnv
+/// `.envrc`) included.
+pub fn system_env_in(root: &Path) -> BTreeMap<String, String> {
+    strings(ide_core::process::host_vars_in(root))
+}
+
+fn strings(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> BTreeMap<String, String> {
+    vars.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
 }
 
 /// Complete environment for a preparatory tool belonging to this run configuration.
@@ -311,7 +333,7 @@ pub fn import_configs(
     existing: &[RunConfig],
 ) -> IdeResult<import::RunImport> {
     // `${env:NAME}` reads what a run inherits, the login shell's variables included.
-    import::import(root, source, existing, &process::inherited_env())
+    import::import(root, source, existing, &process::inherited_env(root))
 }
 
 /// Path of the user run configuration file for `root`.

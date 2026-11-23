@@ -46,18 +46,18 @@ import {
 } from "@/platform/ipc";
 import {
   CONTRIBUTED_DEFINITION,
+  contributedAtAll,
   activeEditor,
-  contributedAt,
   whenSynced,
   type ContributedDefinition,
   type EditorDocContext,
+  openCodeLocation,
 } from "@/editor/api";
 import { structure } from "@/editor/structure";
 import { executeAction } from "@/platform/actions";
 import { basename, relativePath, useProject } from "@/platform/project";
-import { editorService } from "@/workbench/contributions";
 import { fileIconName } from "@/ui";
-import { NO_SERVER, debounce, docOf, isUnavailable, lspRequest, reportLspError } from "./lsp";
+import { NO_SERVER, debounce, docOf, isUnavailable, lspDoc, lspRequest, reportLspError } from "./lsp";
 import { offsetToPos, rangeContains, rangeToOffsets } from "./positions";
 import {
   SYNTAX_NOTE,
@@ -82,6 +82,7 @@ import {
   textReference,
 } from "./links";
 import { featureBackoff } from "./availability";
+import { navigationStarted } from "./foreground";
 import { requestHover, showPhpConstructDocumentation } from "./hover";
 import { declarationSummary, renderCode } from "./markdown";
 import { enclosingType } from "@/editor/navigation/lineMarkers";
@@ -89,7 +90,7 @@ import { projectPythonHierarchy, pythonImplementationTargets } from "@/editor/na
 import { importBindings } from "@/editor/navigation/inheritanceGraph";
 import { editorPrefs } from "@/platform/editorSettings";
 import { isVirtualUri, virtualContainer } from "@/platform/virtualDocs";
-import { isAddCaretGesture } from "@/editor/core/cm/multiCaret";
+import { isAddCaretGesture, isRectangularSelectionGesture } from "@/editor/core/cm/multiCaret";
 import { dispatchMouseShortcut, shortcutLabel } from "@/platform/keymap";
 import { isNavigationGesture, onNavigationModifier, navigationModifierHeld } from "@/platform/navigationModifier";
 import { create } from "zustand";
@@ -107,10 +108,7 @@ import {
 const highlightsBackoff = featureBackoff();
 
 export async function navigateTo(loc: Location) {
-  await editorService().openFile(loc.path, {
-    selection: { line: loc.range.start.line, col: loc.range.start.col },
-    focus: true,
-  });
+  await openCodeLocation(loc.path, { line: loc.range.start.line, col: loc.range.start.col });
 }
 
 const NOT_FOUND: Record<GotoKind, string> = {
@@ -209,7 +207,7 @@ export async function locationItems(locs: readonly DeclarationTarget[]): Promise
   return rows.map(({ l, where, label, container, indexSymbol }, i) => ({
     id: `${i}`,
     label: byContainer ? container! : label,
-    detail: (byContainer ? [where] : [container, where]).filter(Boolean).join(" · "),
+    target: { container: byContainer ? null : container, path: where },
     ...(indexSymbol ? { symbol: l.kind! } : { icon: fileIconName(basename(l.path), l.path) }),
     location: { path: l.path, line: l.range.start.line },
     run: () => navigateTo(l),
@@ -353,9 +351,11 @@ export async function gotoTargets(view: EditorView, kind: GotoKind, at?: number)
   // can take as long as the server's answer.
   const done = showPendingHint(view, tx`Finding navigation target…`);
   pendingGestureHints.set(view, done);
+  const navigated = navigationStarted();
   try {
     await gotoResolved(view, kind, at ?? view.state.selection.main.head, superseded, done);
   } finally {
+    navigated();
     done();
     if (pendingGestureHints.get(view) === done) pendingGestureHints.delete(view);
   }
@@ -384,6 +384,20 @@ async function pythonImplementations(doc: EditorDocContext, pos: Pos): Promise<D
   const hierarchy = await projectPythonHierarchy().catch(() => null);
   if (!hierarchy) return [];
   return pythonImplementationTargets(hierarchy, doc.path, pos, outline).catch(() => []);
+}
+
+/**
+ * Asks for the declaration at `offset`, dropping the target under the caret. Called when Go to
+ * Implementation finds nothing: the jump then ends on the declaration, as in IDEA.
+ */
+async function implementationFallbackTargets(
+  view: EditorView,
+  offset: number,
+  path: string,
+  pos: Pos,
+): Promise<readonly DeclarationTarget[]> {
+  const declaration = await requestNavigation(view, offset, "definition").catch(() => []);
+  return declaration.filter((l) => !isSelfTarget([l], path, pos));
 }
 
 /** Whether `line` (0-based) of `text` is an import statement. */
@@ -444,8 +458,12 @@ async function gotoResolved(
   done: () => void,
 ) {
   if (kind === "definition" || kind === "declaration") {
-    const own = contributedAt<ContributedDefinition>(view.state, CONTRIBUTED_DEFINITION, offset);
-    if (own?.(view, offset)) return;
+    // More than one feature can attach a definition provider to the same file (the
+    // MyBatis SQL support and the Maven POM navigator both see XML). Providers decline
+    // positions they do not own, so try every one instead of letting the first false
+    // result hide the real target.
+    const own = contributedAtAll<ContributedDefinition>(view.state, CONTRIBUTED_DEFINITION, offset);
+    if (own.some((definition) => definition(view, offset))) return;
     if (showPhpConstructDocumentation(view, offset)) return;
     const before = view.state.doc;
     const plugin = await contributedNavigation(view, offset).catch(() => null);
@@ -506,7 +524,17 @@ async function gotoResolved(
     const graph = graphTargets ? await graphTargets : [];
     if (superseded()) return;
     if (graph.length) locs = graph;
-    else if (isCancelled(e) || !declaration) {
+    else if (kind === "implementation" && !isCancelled(e) && !isUnavailable(e)) {
+      // Some servers fail the request instead of answering empty (gopls: "no interfaces
+      // implemented by this method"). Treat that as a search that found nothing, not a broken server.
+      const declarationTargets = await implementationFallbackTargets(view, offset, doc.path, pos);
+      if (superseded()) return;
+      if (!declarationTargets.length) {
+        reportLspError(view, e, true);
+        return;
+      }
+      locs = dedupeLocations(declarationTargets);
+    } else if (isCancelled(e) || !declaration) {
       reportLspError(view, e, true);
       return;
     } else {
@@ -538,6 +566,12 @@ async function gotoResolved(
     return;
   }
   if (superseded()) return;
+  // Outside `gotoAfterEdits`, whose retries would repeat the extra request.
+  if (!locs.length && kind === "implementation" && !serverDown) {
+    const declarationTargets = await implementationFallbackTargets(view, offset, doc.path, pos);
+    if (superseded()) return;
+    locs = dedupeLocations(declarationTargets);
+  }
   if (!locs.length) {
     // The server has no definition here: a link (`href`, `#include`, Markdown) or a file path.
     if (
@@ -548,6 +582,13 @@ async function gotoResolved(
     )
       return;
     if (superseded()) return;
+    // ⌘B on a declaration's own name shows its usages also when the server has no definition
+    // there instead of answering the declaration itself (kotlin-language-server).
+    if (kind === "definition" && !fromSyntax && (await onDeclarationName(view, offset))) {
+      if (superseded()) return;
+      if (!(await executeAction("find.showUsages"))) showHint(view, "No usages found");
+      return;
+    }
     // The server only resolves what it sees: answer from the project index, which also
     // covers attached dependency projects (an unresolved import into them). Never for a
     // module path: a segment is not a symbol name.
@@ -873,7 +914,9 @@ async function probeNavigation(
   const plugin = await contributedNavigation(view, offset).catch(() => null);
   if (plugin) return { info: null, plugin };
   const doc = docOf(view);
-  let navigable = !!contributedAt<ContributedDefinition>(view.state, CONTRIBUTED_DEFINITION, offset);
+  let navigable = contributedAtAll<ContributedDefinition>(view.state, CONTRIBUTED_DEFINITION, offset).some(
+    (definition) => definition.canHandle?.(view.state, offset) ?? true,
+  );
   if (!navigable && doc) {
     const pos = offsetToPos(view.state.doc, offset);
     let fromSyntax = false;
@@ -921,6 +964,8 @@ const linkPlugin = ViewPlugin.fromClass(
     private hovered: string | null = null;
     private probeVersion = 0;
     private probeTimer: ReturnType<typeof setTimeout> | undefined;
+    private middleClickVersion = 0;
+    private stopMiddleClick: (() => void) | null = null;
     constructor(readonly view: EditorView) {
       // Window-wide, so ⌘/Ctrl over an unfocused editor underlines too; released anywhere clears it.
       const offModifier = onNavigationModifier((held) => {
@@ -949,11 +994,86 @@ const linkPlugin = ViewPlugin.fromClass(
       };
     }
     destroy() {
+      this.cancelMiddleClick();
       this.off();
       this.offProviders();
       this.disposed = true;
       this.probeVersion++;
       clearTimeout(this.probeTimer);
+    }
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.startState.facet(lspDoc) !== update.state.facet(lspDoc)) this.cancelMiddleClick();
+    }
+    cancelMiddleClick() {
+      this.middleClickVersion++;
+      this.stopMiddleClick?.();
+    }
+    startMiddleClick(event: MouseEvent) {
+      const view = this.view;
+      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY }, false);
+      if (pos == null) return;
+      const source = view.state.doc;
+      const context = docOf(view);
+      const selection = view.state.selection;
+      const version = this.middleClickVersion;
+      const doc = view.contentDOM.ownerDocument;
+      const win = doc.defaultView!;
+      let dragged = false;
+      // Tolerate click jitter, but a real selection must never turn into navigation.
+      const moved = (e: MouseEvent) =>
+        Math.max(Math.abs(e.clientX - event.clientX), Math.abs(e.clientY - event.clientY)) >= 4 ||
+        (view.state.selection !== selection &&
+          (view.state.selection.ranges.length > 1 || !view.state.selection.main.empty));
+      const cancel = () => this.cancelMiddleClick();
+      const stop = () => {
+        doc.removeEventListener("mousemove", move);
+        doc.removeEventListener("mouseup", up);
+        doc.removeEventListener("keydown", cancel, true);
+        win.removeEventListener("mousedown", cancel, true);
+        win.removeEventListener("blur", cancel);
+        if (this.stopMiddleClick === stop) this.stopMiddleClick = null;
+      };
+      const move = (e: MouseEvent) => {
+        if (!(e.buttons & 4)) return cancel();
+        dragged ||= moved(e);
+      };
+      const up = (e: MouseEvent) => {
+        if (e.button !== 1) return;
+        dragged ||= moved(e);
+        doc.removeEventListener("mousemove", move);
+        doc.removeEventListener("mouseup", up);
+        if (
+          dragged ||
+          e.altKey !== event.altKey ||
+          e.ctrlKey !== event.ctrlKey ||
+          e.metaKey !== event.metaKey ||
+          e.shiftKey !== event.shiftKey ||
+          !view.contentDOM.contains(e.target as Node)
+        ) {
+          stop();
+          return;
+        }
+        // CodeMirror's document mouseup handler must finish before we replace its selection.
+        queueMicrotask(() => {
+          stop();
+          if (
+            version !== this.middleClickVersion ||
+            this.disposed ||
+            view.state.doc !== source ||
+            docOf(view) !== context
+          )
+            return;
+          view.dispatch({ selection: EditorSelection.cursor(pos), effects: setLink.of(null) });
+          view.focus();
+          void gotoTargets(view, "definition", pos);
+        });
+      };
+      this.stopMiddleClick = stop;
+      doc.addEventListener("mousemove", move);
+      doc.addEventListener("mouseup", up);
+      doc.addEventListener("keydown", cancel, true);
+      win.addEventListener("mousedown", cancel, true);
+      win.addEventListener("blur", cancel);
     }
     private set(value: LinkState | null) {
       const current = this.view.state.field(linkField);
@@ -1093,10 +1213,17 @@ const linkPlugin = ViewPlugin.fromClass(
         this.show(false);
       },
       mousedown(e, view) {
+        this.cancelMiddleClick();
         if (e.button !== 0 && e.button !== 1) return false;
         if (isAddCaretGesture(e)) return false;
+        const rectangle = isRectangularSelectionGesture(e);
+        let middleDeclaration = false;
         if (
-          dispatchMouseShortcut(e, () => {
+          dispatchMouseShortcut(e, (id) => {
+            if (e.button === 1 && id === "navigate.declaration") {
+              middleDeclaration = true;
+              return false;
+            }
             const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
             if (pos == null) return false;
             view.dispatch({ selection: EditorSelection.cursor(pos), effects: setLink.of(null) });
@@ -1107,8 +1234,12 @@ const linkPlugin = ViewPlugin.fromClass(
           e.preventDefault();
           return true;
         }
-        // IDEA parity: middle button navigates on a plain click, without the modifier.
-        if (e.button === 1 ? e.metaKey || e.ctrlKey || e.altKey || e.shiftKey : !isNavigationGesture(e)) return false;
+        if (e.button === 1) {
+          if (middleDeclaration || (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey)) this.startMiddleClick(e);
+          // Do not preventDefault here: CodeMirror still needs the press to start a rectangle.
+          return false;
+        }
+        if (rectangle || !isNavigationGesture(e)) return false;
         if (!navigateFromPointer(view, e)) return false;
         e.preventDefault();
         return true;
@@ -1152,6 +1283,12 @@ const marks = {
   read: Decoration.mark({ class: KIND_CLASS.read }),
   write: Decoration.mark({ class: KIND_CLASS.write }),
 };
+/** The text a multi-line highlight paints with line backgrounds: a line class would also colour its indent. */
+const lineText = {
+  text: Decoration.mark({ class: "cm-lsp-occurrence-text" }),
+  read: Decoration.mark({ class: "cm-lsp-occurrence-text" }),
+  write: Decoration.mark({ class: "cm-lsp-occurrence-text cm-lsp-occurrence-text-write" }),
+};
 const fullLines = {
   text: Decoration.line({ class: KIND_CLASS.text }),
   read: Decoration.line({ class: KIND_CLASS.read }),
@@ -1178,7 +1315,7 @@ function highlightDeco(doc: Text, tabSize: number, items: readonly HighlightItem
       class: i.kind === "write" ? "cm-lsp-occurrence-tail cm-lsp-occurrence-tail-write" : "cm-lsp-occurrence-tail",
       attributes: { style: `--lsp-occurrence-from: calc(${LINE_INSET}px + ${col}ch)` },
     });
-    out.push(tail.range(first.from));
+    out.push(tail.range(first.from), lineText[i.kind].range(i.from, last.from));
     for (let n = first.number + 1; n < last.number; n++) out.push(fullLines[i.kind].range(doc.line(n).from));
     if (i.to > last.from) out.push(marks[i.kind].range(last.from, i.to));
   }

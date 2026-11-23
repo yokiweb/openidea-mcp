@@ -199,6 +199,25 @@ describe("Tabs interactions", () => {
     expect(handles[0]!.togglePinSelected()).toBe(false);
   });
 
+  it("shows the modified marker in a pinned editor tab's action slot", () => {
+    const onTogglePin = vi.fn();
+    render(
+      <Tabs
+        variant="editor"
+        items={[{ id: "b", label: "B", text: "B", pinned: true, modified: true }]}
+        activeId="b"
+        onSelect={() => {}}
+        onClose={() => {}}
+        onTogglePin={onTogglePin}
+      />,
+    );
+    const unpin = screen.getByRole("button", { name: "Unpin Tab" });
+    expect(within(unpin.parentElement!).getByLabelText("Modified")).toBeVisible();
+    expect(screen.getByRole("tab", { name: "B Pinned" })).toBeVisible();
+    fireEvent.click(unpin);
+    expect(onTogglePin).toHaveBeenCalledWith("b");
+  });
+
   it("a vertical strip moves with ↑/↓, shows actions above the tabs and has no overflow dropdown", () => {
     const onSelect = vi.fn();
     render(
@@ -358,7 +377,10 @@ describe("Tabs drag & drop", () => {
     hit = strip("Terminal sessions");
     pointer(window, "pointermove", 60);
     expect(dragged).toHaveClass(styles.dragging!);
-    const ghost = document.body.lastElementChild as HTMLElement;
+    // The ghost sits in a copy of the strip's classes, so the strip's tab rules still lay it out.
+    const context = document.body.lastElementChild as HTMLElement;
+    expect(context.className).toBe(strip("Terminal sessions").parentElement!.className);
+    const ghost = context.firstElementChild as HTMLElement;
     expect(ghost).toHaveAttribute("aria-hidden", "true");
     expect(ghost.style.position).toBe("fixed");
     expect(shown("Terminal sessions")).toEqual(["Local", "Local (2)", "Local (3)"]);
@@ -378,7 +400,7 @@ describe("Tabs drag & drop", () => {
         .map((b) => b.textContent),
     ).toEqual(["Local (2)", "Local", "Local (3)"]);
     expect(tab("Terminal sessions", "Local")).not.toHaveClass(styles.dragging!);
-    expect(document.body.lastElementChild).not.toBe(ghost);
+    expect(context.isConnected).toBe(false);
   });
 
   it("puts the slot back when the pointer leaves the strip and drops nothing on Escape", () => {

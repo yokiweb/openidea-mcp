@@ -1,8 +1,8 @@
 //! Protocol tests against in-memory mock language servers.
 
-use ide_core::event::ServerStatus;
+use ide_core::event::{LspRefreshKind, ServerStatus};
 use ide_core::{
-    CancellationToken, DocId, FileEdit, IdeEvent, LanguageId, Pos, Range, ServerId, Severity, WorkspaceEdit,
+    CancellationToken, DocId, FileEdit, IdeEvent, LanguageId, Pos, Range, ServerId, Severity, TaskId, WorkspaceEdit,
 };
 use ide_jsonrpc::{Handler, NoopHandler, Peer};
 use ide_language::{LanguageConfig, LanguageRegistry, LanguageServerConfig};
@@ -23,6 +23,7 @@ use std::time::Duration;
 struct MockState {
     caps: Mutex<Value>,
     missing: std::sync::atomic::AtomicBool,
+    omit_server_info: std::sync::atomic::AtomicBool,
     binary: Mutex<Option<PathBuf>>,
     launches: AtomicUsize,
     notifications: Mutex<Vec<(String, Value)>>,
@@ -149,7 +150,11 @@ impl Handler for MockHandler {
                 if let Some(error) = s.errors.lock().get("initialize").cloned() {
                     return Err(error);
                 }
-                Ok(json!({ "capabilities": s.caps.lock().clone(), "serverInfo": { "name": "mock" } }))
+                let mut result = json!({ "capabilities": s.caps.lock().clone() });
+                if !s.omit_server_info.load(Ordering::SeqCst) {
+                    result["serverInfo"] = json!({ "name": "mock" });
+                }
+                Ok(result)
             }
             "shutdown" => Ok(Value::Null),
             _ => {
@@ -479,6 +484,23 @@ async fn dart_file_watching_requires_an_explicit_registration() {
 // ------------------------------------------------------------------ tests
 
 #[tokio::test(flavor = "multi_thread")]
+async fn servers_start_once_the_project_environment_has_loaded() {
+    let h = harness(&[("mock", incremental_caps())]);
+    // The project's direnv environment (a Nix devshell) is still being read.
+    ide_core::project_env::begin_loading(&h.root);
+    h.open("a.mk", "x");
+    h.wait_status("mock", ServerStatus::Starting).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let server = h.launcher.state("mock");
+    assert_eq!(server.launches.load(Ordering::SeqCst), 0);
+    ide_core::project_env::set(&h.root, vec![("OPENIDEA_TEST_DEVSHELL".into(), Some("1".into()))]);
+    h.wait_status("mock", ServerStatus::Ready).await;
+    assert_eq!(server.launches.load(Ordering::SeqCst), 1);
+    ide_core::project_env::remove(&h.root);
+    h.mgr.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn linked_projects_initialize_separate_language_server_roots() {
     let h = harness(&[("mock", incremental_caps())]);
     let first = tempfile::tempdir().unwrap();
@@ -613,11 +635,12 @@ async fn java_sharing_cancels_a_retiring_initialize_before_starting_its_replacem
     let old = state.peer();
     shared.store(true, Ordering::SeqCst);
     let switched = tokio::time::timeout(Duration::from_secs(2), h.mgr.reconfigure()).await;
-    let closed_before_response = old.is_closed();
-    gate.open();
     switched.expect("initialize cancellation must not wait for its response");
+    // The retiring transport closes asynchronously; wait for it before releasing
+    // the initialize response so the ordering check does not race the close.
+    eventually(|| old.is_closed()).await;
+    gate.open();
     eventually(|| state.requested("initialize").len() == 2).await;
-    assert!(closed_before_response, "the old transport must close before its initialize response is released");
     assert_eq!(h.mgr.servers().len(), 1);
     assert_eq!(h.mgr.servers()[0].root.as_ref(), h.root.as_path());
     h.mgr.shutdown_all().await;
@@ -969,6 +992,33 @@ async fn files_changed_on_disk_reach_the_servers_of_their_language() {
     h.mgr.shutdown_all().await;
 }
 
+/// jdtls runs the annotation processors itself and writes their output; a Maven build's
+/// copy of those files must not reach it as an edit, or jdtls recompiles javac's copy and
+/// overwrites its classes with broken ones (#4128).
+#[tokio::test(flavor = "multi_thread")]
+async fn jdtls_does_not_hear_of_annotation_processor_output() {
+    let h = harness_for("java", "java", &[("jdtls", incremental_caps())], &[]);
+    let (doc, _) = h.open("Open.java", "class Open {}");
+    h.wait_status("jdtls", ServerStatus::Ready).await;
+    let s = h.launcher.state("jdtls");
+    let source = h.root.join("m/src/main/java/com/x/FooMapping.java");
+    let generated = h.root.join("m/target/generated-sources/annotations/com/x/FooMappingImpl.java");
+    let test_generated = h.root.join("m/target/generated-test-sources/test-annotations/com/x/T.java");
+    h.mgr.watched_files_changed(
+        &[test_generated],
+        &[generated.clone(), source.clone()],
+        std::slice::from_ref(&generated),
+        &[h.root.join("m/target/generated-sources/annotations")],
+    );
+    eventually(|| !s.notified("workspace/didChangeWatchedFiles").is_empty()).await;
+    h.mgr.hover(doc, Pos::new(0, 0), Default::default()).await.unwrap();
+    assert_eq!(
+        s.notified("workspace/didChangeWatchedFiles"),
+        vec![json!({ "changes": [{ "uri": uri_of(&source), "type": 2 }] })]
+    );
+    h.mgr.shutdown_all().await;
+}
+
 /// An external change to a document open on the server's current instance reaches it only
 /// through the reload's `didChange`: a watched-file change for it too would make a server
 /// that re-reads the file on one (csharp-ls) apply the reload and then the diff computed
@@ -1275,6 +1325,36 @@ async fn initialize_and_incremental_sync() {
     assert_eq!(infos[0].status, ServerStatus::Ready);
 }
 
+/// Pyright, told the client has workspace folders, asks for its configuration and loads the
+/// workspace only after a `workspace/didChangeConfiguration`: every server gets one at startup.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_server_hears_its_configuration_once_initialized() {
+    let cases = [
+        (None, None, json!({})),
+        (Some(json!({ "flag": true })), None, json!({ "flag": true })),
+        (
+            None,
+            Some(json!({ "python": { "pythonPath": "/venv/bin/python" } })),
+            json!({ "python": { "pythonPath": "/venv/bin/python" } }),
+        ),
+        (Some(json!({ "flag": true })), Some(json!({ "other": 2 })), json!({ "flag": true, "other": 2 })),
+    ];
+    for (init, settings, expected) in cases {
+        let h = harness_configured("mock", "mk", &[("pyright", incremental_caps())], |cfg| {
+            cfg.initialization_options = init.clone().map(|v| toml::Value::try_from(v).unwrap());
+            cfg.settings = settings.clone();
+        });
+        h.open("a.mk", "x");
+        h.wait_status("pyright", ServerStatus::Ready).await;
+        let s = h.launcher.state("pyright");
+        eventually(|| !s.notified("workspace/didChangeConfiguration").is_empty()).await;
+        assert_eq!(s.notified("workspace/didChangeConfiguration"), vec![json!({ "settings": expected })]);
+        let order: Vec<String> = s.notifications.lock().iter().map(|(m, _)| m.clone()).collect();
+        let at = |m: &str| order.iter().position(|n| n == m).unwrap();
+        assert!(at("initialized") < at("workspace/didChangeConfiguration"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn full_sync_and_desync_recovery() {
     let h = harness(&[("full", json!({ "textDocumentSync": 1 })), ("inc", json!({ "textDocumentSync": 2 }))]);
@@ -1408,6 +1488,65 @@ async fn unsupported_feature_names_the_running_servers_that_lack_it() {
     assert_eq!(e.message, "plain, other doesn't support inline completion");
     let e = h.mgr.type_hierarchy(doc, Pos::new(0, 4), HierarchyDirection::Incoming).await.unwrap_err();
     assert_eq!(e.message, "plain, other doesn't support type hierarchy");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flutter_outline_follows_the_document_and_the_server_instance() {
+    let h = harness(&[("mock", incremental_caps())]);
+    let (doc, path) = h.open("a.mk", "Text('x')\n");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let refreshes = || {
+        h.events
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, IdeEvent::LspRefresh { kind: LspRefreshKind::FlutterOutline, .. }))
+            .count()
+    };
+    let at = json!({"start":{"line":0,"character":0},"end":{"line":0,"character":9}});
+    let unit = |children: Value| {
+        json!({ "uri": uri_of(&path), "outline": {
+            "kind": "DART_ELEMENT", "range": at, "codeRange": at,
+            "dartElement": { "kind": "COMPILATION_UNIT", "name": "<unit>" },
+            "children": children,
+        }})
+    };
+    let widgets = json!([{ "kind": "NEW_INSTANCE", "className": "Text", "range": at, "codeRange": at }]);
+    let peer = h.launcher.state("mock").peer();
+    assert!(h.mgr.flutter_outline(doc).is_none());
+
+    peer.notify("dart/textDocument/publishFlutterOutline", unit(widgets.clone())).unwrap();
+    eventually(|| refreshes() == 1).await;
+    assert_eq!(h.mgr.flutter_outline(doc).unwrap()[0].name, "Text");
+
+    // The widgets are gone from the file: the ordinary structure applies again.
+    peer.notify("dart/textDocument/publishFlutterOutline", unit(json!([]))).unwrap();
+    eventually(|| refreshes() == 2).await;
+    assert!(h.mgr.flutter_outline(doc).is_none());
+
+    peer.notify("dart/textDocument/publishFlutterOutline", unit(widgets.clone())).unwrap();
+    eventually(|| refreshes() == 3).await;
+
+    // Reopening starts without the closed document's tree.
+    h.mgr.did_close(doc);
+    assert!(h.mgr.flutter_outline(doc).is_none());
+    let (reopened, _) = h.open("a.mk", "Text('x')\n");
+    assert!(h.mgr.flutter_outline(reopened).is_none());
+    peer.notify("dart/textDocument/publishFlutterOutline", unit(widgets)).unwrap();
+    eventually(|| refreshes() == 4).await;
+    assert!(h.mgr.flutter_outline(reopened).is_some());
+
+    // A restarted server has analysed nothing yet.
+    let server = h
+        .events
+        .lock()
+        .iter()
+        .find_map(|e| match e {
+            IdeEvent::LanguageServer { server, name, .. } if name == "mock" => Some(*server),
+            _ => None,
+        })
+        .unwrap();
+    h.mgr.restart(server).await.unwrap();
+    assert!(h.mgr.flutter_outline(reopened).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1608,6 +1747,36 @@ async fn a_cancelled_pull_is_retried_and_a_refresh_pulls_again() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn show_message_request_unknown_action_replies_null() {
+    let h = harness(&[("mock", incremental_caps())]);
+    h.open("dismiss.mk", "abc\n");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let peer = h.launcher.state("mock").peer();
+    let request = peer.request(
+        "window/showMessageRequest",
+        json!({ "type": 2, "message": "Continue?", "actions": [{ "title": "Yes" }] }),
+        None,
+    );
+    tokio::pin!(request);
+    let id = loop {
+        if let Some(id) = h.events.lock().iter().find_map(|event| match event {
+            IdeEvent::LspMessageRequest { id, message, .. } if message == "Continue?" => Some(*id),
+            _ => None,
+        }) {
+            break id;
+        }
+        tokio::select! {
+            _ = &mut request => panic!("showMessageRequest finished before the UI event"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    };
+    // An action that was not offered must not be sent back as a choice.
+    assert!(ide_lsp::answer_message_request(id, Some("No".into())));
+    let reply: Value = request.await.unwrap();
+    assert_eq!(reply, Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn apply_edit_hook_and_server_requests() {
     let h = harness(&[("mock", incremental_caps())]);
     let (_doc, path) = h.open("a.mk", "abc\n");
@@ -1657,15 +1826,34 @@ async fn apply_edit_hook_and_server_requests() {
     assert_eq!(folders[0]["uri"], json!(uri_of(&h.root)));
     let v: Value = peer.request("window/workDoneProgress/create", json!({ "token": "t" }), None).await.unwrap();
     assert_eq!(v, Value::Null);
-    let v: Value = peer
-        .request(
-            "window/showMessageRequest",
-            json!({ "type": 1, "message": "boom", "actions": [{ "title": "OK" }] }),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(v, Value::Null);
+    let request = peer.request(
+        "window/showMessageRequest",
+        json!({ "type": 1, "message": "Rename Anyway?", "actions": [{ "title": "Rename Anyway" }, { "title": "Cancel" }] }),
+        None,
+    );
+    tokio::pin!(request);
+    let id = loop {
+        if let Some(id) = h.events.lock().iter().find_map(|event| match event {
+            IdeEvent::LspMessageRequest { id, message, actions, .. } if message == "Rename Anyway?" => {
+                assert_eq!(actions, &["Rename Anyway".to_owned(), "Cancel".to_owned()]);
+                Some(*id)
+            }
+            _ => None,
+        }) {
+            break id;
+        }
+        tokio::select! {
+            _ = &mut request => panic!("showMessageRequest finished before the UI event"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    };
+    assert!(ide_lsp::answer_message_request(id, Some("Rename Anyway".into())));
+    let v: Value = request.await.unwrap();
+    assert_eq!(v, json!({ "title": "Rename Anyway" }));
+    eventually(|| {
+        h.events.lock().iter().any(|event| matches!(event, IdeEvent::LspMessageRequestDone { id: done } if *done == id))
+    })
+    .await;
     let v: Value = peer
         .request(
             "client/registerCapability",
@@ -1691,8 +1879,8 @@ async fn apply_edit_hook_and_server_requests() {
     .await;
     let notifies = h.events.lock().iter().filter(|e| matches!(e, IdeEvent::Notify { .. })).count();
     assert_eq!(
-        notifies, 2,
-        "showMessageRequest error + showMessage warning; info and rust-analyzer's developer notices are not surfaced"
+        notifies, 1,
+        "showMessageRequest is now a question with actions, not a notification; info and developer notices are not surfaced"
     );
 
     // Dynamically registered capability is now usable.
@@ -1993,6 +2181,51 @@ async fn replacing_progress_keeps_cancellation_reports_and_indexing_on_the_new_t
             .iter()
             .any(|e| matches!(e, IdeEvent::Task { id, message: Some(m), .. } if *id == old && m == "Halfway"))
     );
+}
+
+/// A server that ignores `window/workDoneProgress/cancel` (Pyright waiting on a workspace
+/// that never loads) does not keep the task "Cancelling…": it ends after a grace period,
+/// once, and later reports on the token change nothing. A server that ends it in time ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_progress_the_server_never_ends_ends_on_its_own() {
+    let h = harness(&[("mock", incremental_caps())]);
+    h.open("a.mk", "x");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let s = h.launcher.state("mock");
+    let peer = s.peer();
+    let begin = |token: &str, title: &str| json!({ "token": token, "value": { "kind": "begin", "title": title, "cancellable": true } });
+    let task_of = |title: &str| {
+        h.events.lock().iter().find_map(|e| match e {
+            IdeEvent::Task { id, title: t, done: false, .. } if t == title => Some(*id),
+            _ => None,
+        })
+    };
+    let ends = |task: TaskId| {
+        h.events.lock().iter().filter(|e| matches!(e, IdeEvent::Task { id, done: true, .. } if *id == task)).count()
+    };
+    peer.notify("$/progress", begin("ignored", "Finding references")).unwrap();
+    peer.notify("$/progress", begin("honoured", "Indexing")).unwrap();
+    eventually(|| task_of("Finding references").is_some() && task_of("Indexing").is_some()).await;
+    h.wait_status("mock", ServerStatus::Busy).await;
+    let (ignored, honoured) = (task_of("Finding references").unwrap(), task_of("Indexing").unwrap());
+
+    assert!(ide_core::task::cancel(ignored));
+    assert!(ide_core::task::cancel(honoured));
+    eventually(|| s.notified("window/workDoneProgress/cancel").len() == 2).await;
+    peer.notify("$/progress", json!({ "token": "honoured", "value": { "kind": "end" } })).unwrap();
+    eventually(|| ends(honoured) == 1).await;
+    assert_eq!(ends(ignored), 0, "the server still has its grace period");
+
+    eventually(|| ends(ignored) == 1).await;
+    h.wait_status("mock", ServerStatus::Ready).await;
+    // Late reports on the token reach no task.
+    peer.notify("$/progress", json!({ "token": "ignored", "value": { "kind": "report", "message": "late" } })).unwrap();
+    peer.notify("$/progress", json!({ "token": "ignored", "value": { "kind": "end" } })).unwrap();
+    peer.notify("$/progress", begin("after", "After")).unwrap();
+    eventually(|| task_of("After").is_some()).await;
+    assert_eq!(ends(ignored), 1);
+    assert_eq!(ends(honoured), 1);
+    assert!(!h.events.lock().iter().any(|e| matches!(e, IdeEvent::Task { message: Some(m), .. } if m == "late")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2493,8 +2726,46 @@ async fn configuration_answer_resyncs_open_documents_of_opted_in_servers() {
         .await;
     assert_eq!(s.notified("textDocument/didChange").len(), 2, "one re-sync per answer");
     let methods: Vec<String> = extra.notifications.lock().iter().map(|(m, _)| m.clone()).collect();
-    assert_eq!(methods, ["initialized", "textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"]);
+    assert_eq!(
+        methods,
+        [
+            "initialized",
+            "workspace/didChangeConfiguration",
+            "textDocument/didOpen",
+            "textDocument/didChange",
+            "textDocument/didSave"
+        ]
+    );
     assert_eq!(s.launches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eslint_configuration_includes_workspace_folder() {
+    let h = harness_configured("mock", "mk", &[("eslint", incremental_caps()), ("mock", incremental_caps())], |cfg| {
+        if cfg.name == "eslint" {
+            cfg.settings = Some(json!({ "workingDirectory": { "mode": "auto" } }));
+        }
+    });
+    h.open("a.mk", "x");
+    h.wait_status("eslint", ServerStatus::Ready).await;
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let items = json!({ "items": [{ "section": "" }] });
+    let eslint: Value =
+        h.launcher.state("eslint").peer().request("workspace/configuration", items.clone(), None).await.unwrap();
+    assert_eq!(
+        eslint,
+        json!([{
+            "flag": true,
+            "nested": { "deep": 1 },
+            "workingDirectory": { "mode": "auto" },
+            "workspaceFolder": {
+                "uri": uri_of(&h.root),
+                "name": h.root.file_name().unwrap().to_string_lossy(),
+            },
+        }])
+    );
+    let other: Value = h.launcher.state("mock").peer().request("workspace/configuration", items, None).await.unwrap();
+    assert_eq!(other, json!([{ "flag": true, "nested": { "deep": 1 } }]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2520,9 +2791,9 @@ async fn settings_changes_reach_servers_without_restarts() {
     let s = h.launcher.state("mock");
     *settings.lock() = Some(json!({ "nested": { "other": 2 } }));
     h.mgr.reconfigure().await;
-    eventually(|| !s.notified("workspace/didChangeConfiguration").is_empty()).await;
+    eventually(|| s.notified("workspace/didChangeConfiguration").len() == 2).await;
     assert_eq!(
-        s.notified("workspace/didChangeConfiguration")[0],
+        s.notified("workspace/didChangeConfiguration")[1],
         json!({ "settings": { "flag": true, "nested": { "deep": 1, "other": 2 } } })
     );
     assert_eq!(s.launches.load(Ordering::SeqCst), 1);
@@ -2895,6 +3166,83 @@ async fn open_java_files_are_checked_again_after_a_project_update() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_project_update_refreshes_java_semantic_tokens() {
+    let h = harness_for("java", "java", &[("jdtls", incremental_caps())], &[]);
+    let _ = h.open("A.java", "class A { private String name; }");
+    h.wait_status("jdtls", ServerStatus::Ready).await;
+    let state = h.launcher.state("jdtls");
+    let refreshes = || {
+        h.events
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, IdeEvent::LspRefresh { kind: LspRefreshKind::SemanticTokens, .. }))
+            .count()
+    };
+    state
+        .peer()
+        .notify("language/status", json!({ "type": "Message", "message": "Updating project configurations..." }))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(refreshes(), 0);
+
+    // jdtls answers with no tokens for a file outside any project and sends no
+    // `workspace/semanticTokens/refresh` once a later import takes it in.
+    state.peer().notify("language/status", json!({ "type": "ProjectStatus", "message": "OK" })).unwrap();
+    eventually(|| refreshes() == 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_update_attaches_maven_generated_sources_before_rechecking() {
+    let mut caps = incremental_caps();
+    caps["executeCommandProvider"]["commands"].as_array_mut().unwrap().push(json!("openidea.java.generatedSources"));
+    let h = harness_for("java", "java", &[("jdtls", caps)], &[]);
+    let (_, _) = h.open("App.java", "package com.example;\nclass App {}");
+    h.wait_status("jdtls", ServerStatus::Ready).await;
+    let write = |rel: &str, text: &str| {
+        let path = h.root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("pom.xml", "<project><artifactId>app</artifactId></project>");
+    write(
+        "target/generated-sources/protobuf/java/com/example/hello/Hello.java",
+        "package com.example.hello;\npublic class Hello {}",
+    );
+    write(
+        "target/generated-sources/protobuf/grpc-java/com/example/hello/HelloGrpc.java",
+        "package com.example.hello;\npublic class HelloGrpc {}",
+    );
+    write(
+        "target/generated-sources/annotations/com/example/hello/HelloMapperImpl.java",
+        "package com.example.hello;\nclass HelloMapperImpl {}",
+    );
+    let state = h.launcher.state("jdtls");
+    state.peer().notify("language/status", json!({ "type": "ProjectStatus", "message": "OK" })).unwrap();
+    eventually(|| {
+        let requests = state.requested("workspace/executeCommand");
+        let generated = requests.iter().position(|p| p["command"] == "openidea.java.generatedSources");
+        let refresh = requests.iter().position(|p| p["command"] == "java.project.refreshDiagnostics");
+        matches!((generated, refresh), (Some(generated), Some(refresh)) if generated < refresh)
+    })
+    .await;
+    let requests = state.requested("workspace/executeCommand");
+    let generated = requests.iter().find(|p| p["command"] == "openidea.java.generatedSources").unwrap();
+    let paths: Vec<_> = generated["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| (PathBuf::from(arg["path"].as_str().unwrap()), arg["test"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            (h.root.join("target/generated-sources/protobuf/grpc-java"), false),
+            (h.root.join("target/generated-sources/protobuf/java"), false),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn library_classes_in_jars_open_as_their_source_or_decompiled() {
     use std::io::Write;
     let jar = |path: &Path, entries: &[(&str, &str)]| {
@@ -3193,7 +3541,7 @@ async fn stream_commands_send_target_then_named_fields() {
     let plan = json!({"root": {"line": 14}});
 
     s.respond("workspace/executeCommand", json!({"ok": {"traceId": 3}}));
-    assert_eq!(tracer.arm(&target, 7, &plan, 500).await.unwrap(), 3);
+    assert_eq!(tracer.arm(&target, 7, &plan, 500, "t1").await.unwrap(), 3);
     s.respond(
         "workspace/executeCommand",
         json!({"ok": {"state": "running", "records": 1, "dropped": 0, "elapsedMs": 2}}),
@@ -3211,18 +3559,24 @@ async fn stream_commands_send_target_then_named_fields() {
     tracer.collect(&target, 3, 2).await.unwrap();
     s.respond("workspace/executeCommand", json!({"ok": {}}));
     tracer.release(&target, 3).await.unwrap();
+    s.respond("workspace/executeCommand", json!({"ok": {}}));
+    tracer.release_armed(&target, "t1").await.unwrap();
 
     let asked = s.requested("workspace/executeCommand");
     let seen: Vec<_> = asked.iter().map(|p| (p["command"].clone(), p["arguments"].clone())).collect();
     assert_eq!(
         seen,
         vec![
-            (json!("openidea.jvm.stream.arm"), json!([target_json, {"threadId": 7, "plan": plan, "budget": 500}])),
+            (
+                json!("openidea.jvm.stream.arm"),
+                json!([target_json, {"threadId": 7, "plan": plan, "budget": 500, "token": "t1"}])
+            ),
             (json!("openidea.jvm.stream.wait"), json!([target_json, {"traceId": 3, "ms": 250}])),
             (json!("openidea.jvm.stream.stop"), json!([target_json, {"traceId": 3}])),
             (json!("openidea.jvm.stream.abort"), json!([target_json, {"traceId": 3}])),
             (json!("openidea.jvm.stream.collect"), json!([target_json, {"traceId": 3}])),
             (json!("openidea.jvm.stream.release"), json!([target_json, {"traceId": 3}])),
+            (json!("openidea.jvm.stream.release"), json!([target_json, {"token": "t1"}])),
         ]
     );
 }
@@ -3303,7 +3657,7 @@ async fn stream_errors_map() {
     ];
     for (reply, expected) in cases {
         s.respond("workspace/executeCommand", reply.clone());
-        assert_eq!(tracer.arm(&target, 1, &json!({}), 10).await.unwrap_err(), expected, "{reply}");
+        assert_eq!(tracer.arm(&target, 1, &json!({}), 10, "t").await.unwrap_err(), expected, "{reply}");
     }
 }
 
@@ -3385,6 +3739,92 @@ async fn stream_collect_fails_cleanly_on_a_step_beyond_u16() {
     );
     let error = tracer.collect(&stream_launch_target(), 3, 2).await.unwrap_err();
     assert!(matches!(error, InspectError::Failed(ref m) if m.contains("malformed")), "{error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exception_breakpoints_send_the_whole_list_and_decode_states() {
+    use ide_jvm_inspect::{ExceptionArmState, ExceptionClassBreakpoints, ExceptionClassSpec};
+    let h = harness_for("java", "java", &[("jdtls", incremental_caps())], &[]);
+    let (_, path) = h.open("Sample.java", "class Sample {}");
+    h.wait_status("jdtls", ServerStatus::Ready).await;
+    let s = h.launcher.state("jdtls");
+    let client = ide_lsp::JdtExceptionBreakpoints::new(h.mgr.clone(), path);
+    let specs = [
+        ExceptionClassSpec {
+            id: "a".into(),
+            class_name: "com.acme.Boom".into(),
+            caught: true,
+            uncaught: false,
+            enabled: true,
+            class_filters: vec!["com.acme.*".into()],
+            class_exclusion_filters: vec![],
+        },
+        ExceptionClassSpec {
+            id: "b".into(),
+            class_name: "java.lang.IllegalStateException".into(),
+            caught: true,
+            uncaught: true,
+            enabled: false,
+            class_filters: vec![],
+            class_exclusion_filters: vec!["*Test".into()],
+        },
+    ];
+    s.respond(
+        "workspace/executeCommand",
+        json!({"ok": [{"id": "a", "state": "pending"}, {"id": "b", "state": "disabled"}]}),
+    );
+    let states = client.set(&stream_launch_target(), &specs).await.unwrap();
+    assert_eq!(states, vec![("a".into(), ExceptionArmState::Pending), ("b".into(), ExceptionArmState::Disabled)]);
+    let asked = s.requested("workspace/executeCommand");
+    assert_eq!(asked[0]["command"], "openidea.jvm.exceptions.set");
+    assert_eq!(
+        asked[0]["arguments"],
+        json!([
+            {"pid": 42, "host": null, "port": null, "generation": 3},
+            {"breakpoints": [
+                {"id": "a", "className": "com.acme.Boom", "caught": true, "uncaught": false, "enabled": true,
+                 "classFilters": ["com.acme.*"], "classExclusionFilters": []},
+                {"id": "b", "className": "java.lang.IllegalStateException", "caught": true, "uncaught": true,
+                 "enabled": false, "classFilters": [], "classExclusionFilters": ["*Test"]},
+            ]},
+        ])
+    );
+
+    s.respond("workspace/executeCommand", json!({"error": "noSession", "detail": "hotCodeReplace is never?"}));
+    assert_eq!(
+        client.set(&stream_launch_target(), &specs).await.unwrap_err(),
+        ide_jvm_inspect::InspectError::NoSession
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exception_class_at_asks_the_extension_and_is_none_without_it() {
+    let mut caps = incremental_caps();
+    caps["executeCommandProvider"] = json!({"commands": ["openidea.java.exceptionType"]});
+    let h = harness_for("java", "java", &[("jdtls", caps)], &[]);
+    let (doc, path) = h.open("Main.java", "class Main {\n  void f() { throw new Failure(); }\n}");
+    h.wait_status("jdtls", ServerStatus::Ready).await;
+    let s = h.launcher.state("jdtls");
+    s.respond("workspace/executeCommand", json!({"qualifiedName": "app.Main$Failure", "displayName": "Failure"}));
+    let found = h.mgr.exception_class_at(doc, Pos::new(1, 23), Default::default()).await.unwrap();
+    assert_eq!(
+        found,
+        Some(ide_lsp::types::ExceptionClassRef {
+            qualified_name: "app.Main$Failure".into(),
+            display_name: "Failure".into()
+        })
+    );
+    let asked = s.requested("workspace/executeCommand");
+    assert_eq!(asked[0]["command"], "openidea.java.exceptionType");
+    assert_eq!(asked[0]["arguments"], json!([uri_of(&path), 1, 23]));
+    s.respond("workspace/executeCommand", json!(null));
+    assert_eq!(h.mgr.exception_class_at(doc, Pos::new(0, 1), Default::default()).await.unwrap(), None);
+
+    let plain = harness_for("java", "java", &[("jdtls", incremental_caps())], &[]);
+    let (doc, _) = plain.open("Main.java", "class Main {}");
+    plain.wait_status("jdtls", ServerStatus::Ready).await;
+    assert_eq!(plain.mgr.exception_class_at(doc, Pos::new(0, 7), Default::default()).await.unwrap(), None);
+    assert!(plain.launcher.state("jdtls").requested("workspace/executeCommand").is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3503,6 +3943,52 @@ async fn a_server_requiring_a_root_marker_serves_only_files_below_one() {
     h.open("a.mk", "x");
     h.wait_status("framework", ServerStatus::Ready).await;
     h.wait_status("alt", ServerStatus::Ready).await;
+}
+
+/// #4061: an Angular template opened under another spelling of the project's
+/// (canonical) path, other letter case on macOS or a symlinked folder, still
+/// gets the Angular server, which answers hover and Go to Declaration there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_framework_server_serves_files_spelt_differently_from_the_project() {
+    let h = harness_configured("mock", "html", &[("framework", incremental_caps())], |cfg| {
+        cfg.root_markers = vec!["angular.json".into()];
+        cfg.require_root_marker = true;
+    });
+    std::fs::write(h.root.join("angular.json"), "{}").unwrap();
+    let app = h.root.join("apps/myapp/src/app");
+    std::fs::create_dir_all(&app).unwrap();
+    let (template, component) = (app.join("example.component.html"), app.join("example.component.ts"));
+    std::fs::write(&template, "<button (click)=\"onConfirm()\">Confirm</button>\n").unwrap();
+    std::fs::write(&component, "export class ExampleComponent {\n  onConfirm() {}\n}\n").unwrap();
+    let framework = h.launcher.state("framework");
+    framework.respond("textDocument/hover", json!({ "contents": "(method) ExampleComponent.onConfirm(): void" }));
+    let target = Range::new(Pos::new(1, 2), Pos::new(1, 11));
+    let range = json!({ "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 11 } });
+    framework.respond("textDocument/definition", json!([{ "uri": uri_of(&component), "range": range }]));
+
+    #[cfg(unix)]
+    let links = tempfile::tempdir().unwrap();
+    let mut spellings = Vec::new();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&h.root, links.path().join("linked")).unwrap();
+        spellings.push(links.path().join("linked").join(template.strip_prefix(&h.root).unwrap()));
+    }
+    // Only on a case-insensitive disk (macOS, Windows).
+    let upper = PathBuf::from(template.to_string_lossy().to_uppercase());
+    if upper.exists() {
+        spellings.push(upper);
+    }
+    for path in spellings {
+        let doc = DocId::next();
+        h.mgr.did_open(doc, &path, &h.lang, 1, "<button (click)=\"onConfirm()\">Confirm</button>\n");
+        eventually(|| framework.docs.lock().contains_key(&uri_of(&path))).await;
+        let hover = h.mgr.hover(doc, Pos::new(0, 20), Default::default()).await.unwrap();
+        assert!(hover.is_some_and(|h| h.contents.value.contains("onConfirm")), "{}", path.display());
+        let defs = h.mgr.goto(doc, Pos::new(0, 20), GotoKind::Definition).await.unwrap();
+        assert_eq!((&*defs[0].path, defs[0].range), (component.as_path(), target), "{}", path.display());
+    }
+    assert_eq!(h.statuses("framework").iter().filter(|s| **s == ServerStatus::Starting).count(), 1);
 }
 
 /// A server that `replaces` another (a PHP server with its own Laravel support and
@@ -3747,6 +4233,156 @@ async fn java_dependency_implementations_point_at_the_method() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn formatting_a_snapshot_never_changes_an_open_document() {
+    let caps = json!({
+        "positionEncoding": "utf-8",
+        "textDocumentSync": { "openClose": true, "change": 2 },
+        "documentFormattingProvider": true,
+    });
+    let h = harness(&[("mock", caps)]);
+    let (_, path) = h.open("a.mk", "different working text\n");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let s = h.launcher.state("mock");
+    s.respond(
+        "textDocument/formatting",
+        json!([{ "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 5 } }, "newText": "X" }]),
+    );
+    let options = FormatOptions { tab_size: 2, insert_spaces: true, on_save: false, tool: None };
+    let edits = h.mgr.format_text(&path, &LanguageId("mock".into()), "🙂b\n", options).await.unwrap();
+    assert_eq!(edits, vec![ide_core::TextEdit { range: rng(0, 2, 0, 3), new_text: "X".into() }]);
+
+    let uri = uri_of(&path);
+    let requests = s.requested("textDocument/formatting");
+    let shadow = requests[0]["textDocument"]["uri"].as_str().unwrap();
+    assert_ne!(shadow, uri);
+    let opens = s.notified("textDocument/didOpen");
+    let snapshot = opens.iter().find(|n| n["textDocument"]["uri"] == shadow).unwrap();
+    assert_eq!(snapshot["textDocument"]["text"], "🙂b\n");
+    assert!(s.notified("textDocument/didChange").is_empty());
+    eventually(|| uris(&s.notified("textDocument/didClose")) == vec![shadow.to_owned()]).await;
+    assert!(s.docs.lock().contains_key(&uri));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_diagnostics_collect_pull_and_push_without_publishing_problems() {
+    let mut pull_caps = incremental_caps();
+    pull_caps["diagnosticProvider"] = json!({ "interFileDependencies": false, "workspaceDiagnostics": false });
+    let mut push_caps = incremental_caps();
+    push_caps["positionEncoding"] = json!("utf-8");
+    let h = harness(&[("mock", pull_caps), ("push", push_caps)]);
+    let pull = h.launcher.state("mock");
+    *pull.responder.lock() = Some(pull_responder());
+    let (_, path) = h.open("a.mk", "clean editor\n");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    h.wait_status("push", ServerStatus::Ready).await;
+    let push = h.launcher.state("push");
+    let live = uri_of(&path);
+    let shadow = || {
+        push.notified("textDocument/didOpen")
+            .into_iter()
+            .find(|n| n["textDocument"]["text"] == "🙂bad\n")
+            .and_then(|n| n["textDocument"]["uri"].as_str().map(str::to_owned))
+    };
+    let send = async {
+        eventually(|| shadow().is_some()).await;
+        let uri = shadow().unwrap();
+        for (version, message) in [(1, "wrong version"), (0, "snapshot only")] {
+            push.peer()
+                .notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": uri, "version": version, "diagnostics": [{
+                            "range": {"start": {"line":0,"character":4}, "end": {"line":0,"character":7}},
+                            "severity": 2, "message": message
+                        }]
+                    }),
+                )
+                .unwrap();
+        }
+        uri
+    };
+    let language = LanguageId("mock".into());
+    let cancel = Default::default();
+    let (result, shadow) = tokio::join!(h.mgr.snapshot_diagnostics(&path, &language, "🙂bad\n", &cancel), send);
+    assert_ne!(shadow, live);
+    let mut items = result.unwrap();
+    items.sort_by(|a, b| a.message.cmp(&b.message));
+    assert_eq!(items.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(), ["bad", "snapshot only"]);
+    assert_eq!(items[1].range, rng(0, 2, 0, 5));
+    eventually(|| uris(&push.notified("textDocument/didClose")) == vec![shadow.clone()]).await;
+    assert!(uris(&push.notified("textDocument/didChange")).is_empty());
+    assert!(push.docs.lock().contains_key(&live));
+    assert!(!h.events.lock().iter().any(|event| matches!(
+        event,
+        IdeEvent::Diagnostics { items, .. } if !items.is_empty()
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_actions_use_snapshot_text_and_accept_only_its_passive_edits() {
+    let caps = json!({
+        "positionEncoding": "utf-8",
+        "textDocumentSync": { "openClose": true, "change": 2 },
+        "codeActionProvider": { "resolveProvider": true },
+    });
+    let h = harness(&[("mock", caps)]);
+    let (_, path) = h.open("a.mk", "the live editor\n");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let s = h.launcher.state("mock");
+    let uri = uri_of(&path);
+    let original = uri.clone();
+    *s.responder.lock() = Some(Arc::new(move |_, method, params| {
+        let edit = json!({ "range": {
+            "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 5 }
+        }, "newText": "X" });
+        match method {
+            "textDocument/codeAction" => {
+                let shadow = params["textDocument"]["uri"].as_str().unwrap();
+                assert_ne!(shadow, original);
+                assert_eq!(params["range"]["end"], json!({ "line": 0, "character": 5 }));
+                assert_eq!(params["context"]["diagnostics"], json!([]));
+                let kind = params["context"]["only"][0].as_str().unwrap();
+                if kind == "source.fixAll" {
+                    return Some(json!([{ "title": "Cleanup", "kind": kind, "edit": { "documentChanges": [{
+                        "textDocument": { "uri": shadow, "version": 0 }, "edits": [edit]
+                    }] }}]));
+                }
+                assert_eq!(kind, "source.organizeImports");
+                Some(json!([
+                    { "title": "Cross-file edit", "kind": kind, "isPreferred": true,
+                      "edit": { "changes": { shadow: [edit.clone()], original.clone(): [edit.clone()] } } },
+                    { "title": "Command", "kind": kind, "isPreferred": true,
+                      "command": { "title": "Command", "command": "mock.organize" },
+                      "edit": { "changes": { shadow: [edit] } } },
+                    { "title": "Organize", "kind": kind, "data": { "snapshot": shadow } }
+                ]))
+            }
+            "codeAction/resolve" => {
+                let shadow = params["data"]["snapshot"].as_str().unwrap();
+                Some(json!({ "title": "Organize", "edit": { "changes": { shadow: [edit] } } }))
+            }
+            _ => None,
+        }
+    }));
+    for kind in ["source.organizeImports", "source.fixAll"] {
+        let edits = h
+            .mgr
+            .source_action_text(&path, &LanguageId("mock".into()), "🙂b", kind, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(edits, vec![ide_core::TextEdit { range: rng(0, 2, 0, 3), new_text: "X".into() }]);
+    }
+    assert!(s.requested("workspace/executeCommand").is_empty());
+    assert!(s.notified("textDocument/didChange").is_empty());
+    eventually(|| s.notified("textDocument/didClose").len() == 2).await;
+    let snapshots: Vec<_> =
+        s.notified("textDocument/didOpen").into_iter().filter(|notice| notice["textDocument"]["uri"] != uri).collect();
+    assert_eq!(snapshots.len(), 2);
+    assert!(snapshots.iter().all(|notice| notice["textDocument"]["text"] == "🙂b"));
+    assert!(s.docs.lock().contains_key(&uri));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn navigation_rename_format_and_decorations() {
     let h = harness(&[("mock", incremental_caps())]);
     let (doc, path) = h.open("a.mk", "fn foo() {}\nfoo();\n");
@@ -3828,16 +4464,31 @@ async fn navigation_rename_format_and_decorations() {
     let item = json!({ "name": "foo", "kind": 12, "uri": uri, "range": r(0,0,0,11), "selectionRange": r(0,3,0,6), "data": "id" });
     s.respond("textDocument/prepareCallHierarchy", json!([item]));
     s.respond("callHierarchy/incomingCalls", json!([{ "from": { "name": "main", "kind": 12, "uri": uri, "range": r(1,0,1,6), "selectionRange": r(1,0,1,3) }, "fromRanges": [r(1,0,1,3)] }]));
-    let calls = h
-        .mgr
-        .call_hierarchy(doc, Pos::new(0, 4), HierarchyDirection::Incoming, Default::default())
-        .await
-        .unwrap()
-        .items;
+    let hierarchy =
+        h.mgr.call_hierarchy(doc, Pos::new(0, 4), HierarchyDirection::Incoming, Default::default()).await.unwrap();
+    let root = hierarchy.root.expect("the prepared item");
+    assert_eq!((root.name.as_str(), root.selection_range), ("foo", rng(0, 3, 0, 6)));
+    assert_eq!(root.path.to_path_buf(), path);
+    let calls = hierarchy.items;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "main");
     assert_eq!(calls[0].from_ranges, vec![rng(1, 0, 1, 3)]);
     assert_eq!(s.requested("callHierarchy/incomingCalls")[0]["item"]["data"], "id");
+
+    // Outgoing calls of each prepared item are in that item's file.
+    let other = path.with_file_name("b.mk");
+    let second =
+        json!({ "name": "foo", "kind": 12, "uri": uri_of(&other), "range": r(4,0,4,11), "selectionRange": r(4,3,4,6) });
+    s.respond("textDocument/prepareCallHierarchy", json!([item, second]));
+    s.respond("callHierarchy/outgoingCalls", json!([{ "to": { "name": "bar", "kind": 12, "uri": uri, "range": r(2,0,2,6), "selectionRange": r(2,0,2,3) }, "fromRanges": [r(0,8,0,11)] }]));
+    let callees = h
+        .mgr
+        .call_hierarchy(doc, Pos::new(0, 4), HierarchyDirection::Outgoing, Default::default())
+        .await
+        .unwrap()
+        .items;
+    let from: Vec<_> = callees.iter().map(|c| c.from_path.clone().map(|p| p.into_path_buf())).collect();
+    assert_eq!(from, [Some(path.clone()), Some(other)]);
 
     // No documentSymbolProvider → None so callers fall back to tree-sitter.
     assert_eq!(h.mgr.document_symbols(doc).await.unwrap(), None);
@@ -7634,6 +8285,39 @@ async fn notebook_edits_change_cell_text_and_reorders_reopen_it() {
     h.mgr.restart(server).await.unwrap();
     eventually(|| nb.launches.load(Ordering::SeqCst) > launches && nb.notified("notebookDocument/didOpen").len() == 3)
         .await;
+    h.mgr.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_go_file_reuses_module_and_reopens_after_restart() {
+    let h = harness_configured("go", "go", &[("gopls", incremental_caps())], |cfg| {
+        cfg.root_markers = vec!["go.work".into(), "go.mod".into()];
+    });
+    h.launcher.state("gopls").omit_server_info.store(true, Ordering::SeqCst);
+    let module = h.root.join("service");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("go.mod"), "module example.test/service\n").unwrap();
+    h.open("service/main.go", "package service\n");
+    h.wait_status("gopls", ServerStatus::Ready).await;
+    let cache = tempfile::tempdir().unwrap();
+    let external = cache.path().join("dependency.go");
+    std::fs::write(&external, "package dependency\n").unwrap();
+    let doc = DocId::next();
+    h.mgr.did_open(doc, &external, &h.lang, 1, "package dependency\n");
+    let state = h.launcher.state("gopls");
+    let opened_external = || {
+        state.notified("textDocument/didOpen").iter().filter(|p| p["textDocument"]["uri"] == uri_of(&external)).count()
+    };
+    eventually(|| opened_external() == 1).await;
+    assert_eq!(state.launches.load(Ordering::SeqCst), 1);
+    let id = h.mgr.servers()[0].id;
+    h.mgr.restart(id).await.unwrap();
+    eventually(|| opened_external() == 2).await;
+    assert_eq!(state.launches.load(Ordering::SeqCst), 2);
+    assert_eq!(h.mgr.servers().len(), 1);
+    let inits = state.requested("initialize");
+    assert_eq!(inits.len(), 2);
+    assert!(inits.iter().all(|p| p["rootUri"] == uri_of(&module)));
     h.mgr.shutdown_all().await;
 }
 

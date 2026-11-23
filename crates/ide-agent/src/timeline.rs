@@ -54,6 +54,23 @@ impl Timeline {
         let mut out = Applied::default();
         let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or_default();
         match kind {
+            "user_question" => {
+                let id = str_field(update, "id");
+                let Ok(questions) = serde_json::from_value::<Vec<crate::model::AgentQuestion>>(
+                    update.get("questions").cloned().unwrap_or(Value::Null),
+                ) else {
+                    return out;
+                };
+                if id.is_empty()
+                    || questions.is_empty()
+                    || self.entries.iter().any(|e| matches!(e, AgentEntry::Question { id: known, .. } if known == &id))
+                {
+                    return out;
+                }
+                let index =
+                    self.push(AgentEntry::Question { id, title: str_field(update, "title"), questions, chosen: None });
+                out.changed.push(index);
+            }
             "agent_message_chunk" | "agent_thought_chunk" => {
                 let Some(text) = content_text(update.get("content")) else { return out };
                 out.changed.push(self.append_text(kind == "agent_thought_chunk", &text));
@@ -68,6 +85,8 @@ impl Timeline {
                     locations: locations(update.get("locations")),
                     output: None,
                     diffs: Vec::new(),
+                    started_ms: Some(crate::now_ms()),
+                    ended_ms: None,
                 };
                 let index = match self.tools.get(&id) {
                     Some(&i) => {
@@ -117,17 +136,22 @@ impl Timeline {
     fn append_text(&mut self, thought: bool, text: &str) -> usize {
         match self.entries.last_mut() {
             Some(AgentEntry::Agent { text: t }) if !thought => t.push_str(text),
-            Some(AgentEntry::Thought { text: t }) if thought => t.push_str(text),
+            Some(AgentEntry::Thought { text: t, .. }) if thought => t.push_str(text),
             _ => {
                 let text = text.to_owned();
-                return self.push(if thought { AgentEntry::Thought { text } } else { AgentEntry::Agent { text } });
+                return self.push(if thought {
+                    AgentEntry::Thought { text, started_ms: Some(crate::now_ms()) }
+                } else {
+                    AgentEntry::Agent { text }
+                });
             }
         }
         self.entries.len() - 1
     }
 
     fn merge_tool(&mut self, index: usize, update: &Value) {
-        let AgentEntry::Tool { title, kind, status, locations: locs, output, diffs, .. } = &mut self.entries[index]
+        let AgentEntry::Tool { title, kind, status, locations: locs, output, diffs, ended_ms, .. } =
+            &mut self.entries[index]
         else {
             return;
         };
@@ -139,6 +163,9 @@ impl Timeline {
         }
         if let Some(s) = tool_status(update.get("status")) {
             *status = s;
+            if matches!(s, AgentToolStatus::Completed | AgentToolStatus::Failed) && ended_ms.is_none() {
+                *ended_ms = Some(crate::now_ms());
+            }
         }
         if update.get("locations").is_some_and(Value::is_array) {
             *locs = locations(update.get("locations"));
@@ -166,6 +193,11 @@ impl Timeline {
             }
         }
         if !text.is_empty() {
+            // The command a call announced (`$ cmd`) stays above the result that replaces it.
+            let command = output.as_deref().and_then(|o| o.lines().next()).filter(|l| l.starts_with("$ "));
+            if let Some(command) = command.filter(|c| !text.starts_with(c)) {
+                text = format!("{command}\n{text}");
+            }
             *output = Some(tail(text));
         }
         if !new_diffs.is_empty() {
@@ -389,6 +421,25 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn asynchronous_questions_survive_turn_end_restart_and_duplicate_notifications() {
+        let mut t = Timeline::default();
+        let update = json!({"sessionUpdate":"user_question","id":"call-1","title":"Which?",
+            "questions":[{"answerKey":"q1","question":"Which?","options":[]}]});
+        assert_eq!(t.apply(&update).changed, vec![0]);
+        assert!(t.end_turn(None).is_empty());
+        assert!(matches!(&t.entries[0], AgentEntry::Question { chosen: None, .. }));
+        let saved = serde_json::to_string(&t.entries).unwrap();
+        let mut t = Timeline::from_entries(serde_json::from_str(&saved).unwrap());
+        assert!(t.apply(&update).changed.is_empty());
+        assert_eq!(t.entries.len(), 1);
+        if let AgentEntry::Question { chosen, .. } = &mut t.entries[0] {
+            *chosen = Some("One".into());
+        }
+        assert!(t.apply(&update).changed.is_empty());
+        assert!(matches!(&t.entries[0], AgentEntry::Question { chosen: Some(answer), .. } if answer == "One"));
+    }
+
+    #[test]
     fn chunks_merge_into_one_message_until_another_entry_comes() {
         let mut t = Timeline::default();
         let chunk = |s: &str| json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": s}});
@@ -396,11 +447,14 @@ mod tests {
         assert_eq!(t.apply(&chunk("lo")).changed, vec![0]);
         t.apply(&json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}}));
         t.apply(&chunk("again"));
+        // The thought's start is the clock's: it is there, and the rest compares exactly.
+        let AgentEntry::Thought { started_ms, .. } = &mut t.entries[1] else { panic!("{:?}", t.entries) };
+        assert!(started_ms.take().is_some());
         assert_eq!(
             t.entries,
             vec![
                 AgentEntry::Agent { text: "Hello".into() },
-                AgentEntry::Thought { text: "hmm".into() },
+                AgentEntry::Thought { text: "hmm".into(), started_ms: None },
                 AgentEntry::Agent { text: "again".into() },
             ]
         );
@@ -490,6 +544,25 @@ mod tests {
         assert_eq!(t.end_turn(Some(5.0)), vec![0]);
         assert!(matches!(t.entries[0], AgentEntry::User { done_ms: Some(5.0), .. }));
         assert!(matches!(t.entries[2], AgentEntry::User { done_ms: None, .. }));
+    }
+
+    #[test]
+    fn a_hermes_terminal_call_keeps_its_command_and_times() {
+        let text = |t: &str| serde_json::json!([{"type": "content", "content": {"type": "text", "text": t}}]);
+        let mut t = Timeline::default();
+        t.apply(&serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "tc-0b98b5e30a28",
+            "kind": "execute", "title": "terminal: echo ok + 2 commands", "locations": [],
+            "content": text("$ echo ok >> notes.txt && wc -l notes.txt")}));
+        let AgentEntry::Tool { started_ms, ended_ms, .. } = &t.entries[0] else { panic!() };
+        assert!(started_ms.is_some() && ended_ms.is_none());
+        t.apply(&serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "tc-0b98b5e30a28",
+            "kind": "execute", "status": "completed",
+            "content": text("terminal result\n- **output:** 3 notes.txt\n- **exit_code:** 0")}));
+        let AgentEntry::Tool { output, status, ended_ms, .. } = &t.entries[0] else { panic!() };
+        assert_eq!(*status, AgentToolStatus::Completed);
+        assert!(ended_ms.is_some());
+        let expected = "$ echo ok >> notes.txt && wc -l notes.txt\nterminal result\n- **output:** 3 notes.txt\n";
+        assert_eq!(output.as_deref(), Some(format!("{expected}- **exit_code:** 0").as_str()));
     }
 
     #[test]

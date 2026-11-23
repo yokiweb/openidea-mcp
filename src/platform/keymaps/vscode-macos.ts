@@ -5,6 +5,7 @@
  */
 export const vscodeMacos: Record<string, string[]> = {
   "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
+  "editor.createRectangularSelectionOnMouseDrag": ["Alt+Button1", "Button2"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": [],
@@ -331,9 +332,17 @@ export const vscodeMacos: Record<string, string[]> = {
   "view.quickSwitchScheme": [],
   // Commit tool window (change lists) and Git log; keyWhen limits them to those tool windows.
   "vcs.changelist.move": [],
+  "vcs.shelveSilently": [],
+  "vcs.unshelveSilently": [],
   "vcs.changelist.edit": [],
   "vcs.log.copyRevision": [],
   "vcs.log.goToRef": [],
+  "vcs.log.editMessage": [],
+  "vcs.log.newBranch": [],
+  "vcs.log.goToChild": [],
+  "vcs.log.goToParent": [],
+  "vcs.log.toggleBookmark": [],
+  "vcs.log.toggleBookmarkWithMnemonic": [],
   // View › Appearance (VS Code: workbench.action.zoomIn / zoomOut / zoomReset)
   "view.zoomIn": ["Meta+="],
   "view.zoomOut": ["Meta+-"],
@@ -425,6 +434,8 @@ export const vscodeMacos: Record<string, string[]> = {
   "agents.cycleEffort": ["Alt+T"],
   "agents.showToolWindow": [],
   "agents.sendToAgent": [],
+  // Python Console: VS Code's Shift+Enter would shadow typing in Python files, so unbound.
+  "python.console.executeSelection": [],
   // Search fields (find bar, Find in Files): last, so they win over editor keys while one is focused.
   "find.openInWindow": ["Alt+F7"],
   "find.field.newLine": ["Meta+Shift+Enter"],

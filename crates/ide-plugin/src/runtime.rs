@@ -16,9 +16,11 @@ use crate::types::{
     FieldValue, ServiceLog, ServiceLogToggle, ServicePane, ServiceTab, TableSort, View, ViewBody, ViewButton,
     ViewEvent, ViewField, ViewListItem, ViewTable, ViewTreeItem, Viewport,
 };
+use crate::wit_host::hover_actions_bindings::exports::openidea::plugin::hover_actions as wit_hia;
 use crate::wit_host::injections_bindings::exports::openidea::plugin::injections as wit_inj;
 use crate::wit_host::language_features_bindings::exports::openidea::plugin::language_features as wit_lf;
 use crate::wit_host::run_target_validation_bindings::exports::openidea::plugin::run_target_validation as wit_rtv;
+use crate::wit_host::search_bindings::exports::openidea::plugin::search_provider as wit_search;
 use crate::wit_host::{
     bindings, commit_checks_bindings, details_bindings, endpoints_bindings, file_actions_bindings, hover_bindings,
     indexing_bindings, inlay_bindings, providers_bindings, semantic_bindings, syntax_bindings, views_bindings,
@@ -56,9 +58,11 @@ use views_bindings::exports::openidea::plugin::view_provider as wit_view;
 use views_bindings::openidea::plugin::view_types as wit_vt;
 
 /// The API version of the world above, `major.minor` of [`host_api`].
-pub const API_VERSION: &str = "1.10";
+pub const API_VERSION: &str = "1.15";
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 pub(crate) const MAX_TEXT: usize = 1 << 20;
+/// The most text, and the most PNG bytes, `ui.read-clipboard` returns.
+pub const MAX_CLIPBOARD_BYTES: usize = 16 << 20;
 pub(crate) const MAX_TITLE: usize = 256;
 const STDERR_CAPACITY: usize = 256 << 10;
 /// Message of a call interrupted through [`Runtime::cancel_handle`].
@@ -318,6 +322,12 @@ pub trait HostApi: Send + Sync {
         let _ = (client, text);
         Ok(())
     }
+    /// The clipboard of the machine `client`'s window runs on, as that window reads it;
+    /// waits for the window until `cancel` fires.
+    fn read_clipboard(&self, client: &str, cancel: &CancellationToken) -> Result<crate::ClipboardContent, HostError> {
+        let _ = (client, cancel);
+        Err(HostError::Failed("the clipboard is unavailable".into()))
+    }
     fn open_url(&self, client: Option<&str>, url: String) -> Result<(), HostError> {
         let _ = (client, url);
         Ok(())
@@ -378,10 +388,20 @@ pub trait HostApi: Send + Sync {
     }
     /// Sets (`Some`) or removes the plugin's status bar item `id`.
     fn status_item(&self, id: &str, item: Option<StatusItem>);
+    /// Checks a status item menu before it is set: its actions name commands the plugin declares.
+    fn check_status_menu(&self, menu: &[crate::StatusMenuEntry]) -> Result<(), HostError> {
+        let _ = menu;
+        Ok(())
+    }
     /// Sets or removes the status override in the invoking window.
     fn window_status_item(&self, client: &str, id: &str, item: Option<StatusItem>) -> Result<(), HostError> {
         let _ = (client, id, item);
         Err(HostError::Invalid("window status unavailable".into()))
+    }
+    /// Replaces the plugin's console highlight rules (API 1.12); empty removes them.
+    fn console_rules(&self, rules: Vec<crate::ConsoleRule>) -> Result<(), HostError> {
+        let _ = rules;
+        Err(HostError::Failed("console rules unavailable".into()))
     }
     /// Sets (`Some`, validated JSON text) or removes the plugin's context key,
     /// for window `client` (every window if `None`).
@@ -563,6 +583,19 @@ pub trait HostApi: Send + Sync {
         cancel: &CancellationToken,
         timeout: Duration,
     ) -> Result<ProcessOutput, HostError>;
+    /// Runs `cmd` with configurable capture options (API 1.15).
+    fn run_process_with_options(
+        &self,
+        cmd: ProcessCommand,
+        cwd: Option<&Path>,
+        stdin: Option<String>,
+        cancel: &CancellationToken,
+        timeout: Duration,
+        options: Option<crate::types::ProcessOptions>,
+    ) -> Result<ProcessOutput, HostError> {
+        let _ = options;
+        self.run_process(cmd, cwd, stdin, cancel, timeout)
+    }
     /// Delivers every event of `kind`, dropping its path filter.
     fn subscribe(&self, kind: EventKind);
     /// Delivers `kind` (`file-opened`, `file-saved`, `files-changed`) only for matching paths.
@@ -570,6 +603,17 @@ pub trait HostApi: Send + Sync {
     fn unsubscribe(&self, kind: &str);
     /// Starts `cmd` and returns the handle to it without waiting.
     fn start_process(&self, cmd: ProcessCommand, cwd: Option<&Path>, client: Option<&str>) -> Result<u64, HostError>;
+    /// Starts `cmd` with streaming options (API 1.15).
+    fn start_process_stream(
+        &self,
+        cmd: ProcessCommand,
+        cwd: Option<&Path>,
+        client: Option<&str>,
+        options: Option<crate::types::ProcessOptions>,
+    ) -> Result<u64, HostError> {
+        let _ = options;
+        self.start_process(cmd, cwd, client)
+    }
     /// What process `id` printed since the last call, each stream at most
     /// `max` bytes (the rest waits for the next call), and its status once it
     /// ended.
@@ -631,6 +675,10 @@ pub trait HostApi: Send + Sync {
     /// The plugin's private directory, independent of the current invocation.
     fn plugin_dir(&self) -> Result<PathBuf, HostError> {
         Err(HostError::Failed("private plugin storage is unavailable".into()))
+    }
+    /// The plugin's install / package directory (read-only for the guest).
+    fn install_dir(&self) -> Result<PathBuf, HostError> {
+        Err(HostError::Failed("plugin install directory is unavailable".into()))
     }
     /// Replaces the text of a file whose real path the caller already checked:
     /// in one step, keeping its encoding and BOM (a new file is UTF-8). Refused
@@ -882,7 +930,9 @@ pub struct StoreData {
     pub(crate) invocation: Invocation,
     /// The running call is a command or an event.
     pub(crate) interactive: bool,
-    pub(crate) net_interactive: bool,
+    /// The user ran it: a command, or a view action other than a web view message.
+    /// Gates what must not happen unattended (`net:ask` prompts, reading the clipboard).
+    pub(crate) user_invoked: bool,
     /// Editor window for pick, pick-many, input and confirm during action resolution.
     pub(crate) action_prompt_client: Option<String>,
     /// Tasks begun by the running call and not ended yet.
@@ -1032,6 +1082,8 @@ struct Exports {
     commit_checks: Option<wit_cc::Guest>,
     inlay: Option<wit_inlay::Guest>,
     endpoints: Option<wit_endpoints::Guest>,
+    search: Option<wit_search::Guest>,
+    hover_actions: Option<wit_hia::Guest>,
     run_configurations: Option<wit_configs::Guest>,
     launch_configurations: Option<wit_launch::Guest>,
     test_results: Option<wit_tests::Guest>,
@@ -1080,6 +1132,16 @@ fn event_to_wit(e: WorkbenchEvent) -> wit_events::Event {
         WorkbenchEvent::InputModeChanged(mode) => wit_events::Event::Other(wit_types::Extension {
             kind: "input-mode-changed".into(),
             data: serde_json::to_string(&mode).expect("mode serializes"),
+        }),
+        WorkbenchEvent::CaretMoved(caret) => wit_events::Event::Other(wit_types::Extension {
+            kind: "caret-moved".into(),
+            data: serde_json::json!({
+                "path": caret.path,
+                "line": caret.line,
+                "col": caret.col,
+                "settled": caret.settled,
+            })
+            .to_string(),
         }),
         WorkbenchEvent::FileOpened(p) => wit_events::Event::FileOpened(p),
         WorkbenchEvent::FileSaved(p) => wit_events::Event::FileSaved(p),
@@ -1132,7 +1194,7 @@ impl Runtime {
             host: setup.host,
             invocation: Invocation::default(),
             interactive: false,
-            net_interactive: false,
+            user_invoked: false,
             action_prompt_client: None,
             open_tasks: Vec::new(),
             last_report: None,
@@ -1172,6 +1234,8 @@ impl Runtime {
         let commit_check_indices = wit_cc::GuestIndices::new(&pre).ok();
         let inlay_indices = wit_inlay::GuestIndices::new(&pre).ok();
         let endpoint_indices = wit_endpoints::GuestIndices::new(&pre).ok();
+        let search_indices = wit_search::GuestIndices::new(&pre).ok();
+        let hover_actions_indices = wit_hia::GuestIndices::new(&pre).ok();
         let configs_indices = wit_configs::GuestIndices::new(&pre).ok();
         let launch_indices = wit_launch::GuestIndices::new(&pre).ok();
         let tests_indices = wit_tests::GuestIndices::new(&pre).ok();
@@ -1236,6 +1300,9 @@ impl Runtime {
             Some(indices) => Some(indices.load(&mut store, &instance).map_err(api_hint)?),
             None => None,
         };
+        let search = search_indices.map(|i| i.load(&mut store, &instance)).transpose().map_err(api_hint)?;
+        let hover_actions =
+            hover_actions_indices.map(|i| i.load(&mut store, &instance)).transpose().map_err(api_hint)?;
         let endpoints = match endpoint_indices {
             Some(indices) => Some(indices.load(&mut store, &instance).map_err(api_hint)?),
             None => None,
@@ -1258,6 +1325,8 @@ impl Runtime {
                 commit_checks,
                 inlay,
                 endpoints,
+                search,
+                hover_actions,
                 run_configurations,
                 launch_configurations,
                 test_results,
@@ -1783,7 +1852,7 @@ impl Runtime {
         let result = self.call(invocation, self.limits.timeout, |e, store| {
             let ctx = store.data_mut().new_invocation()?;
             store.data_mut().interactive = true;
-            store.data_mut().net_interactive = true;
+            store.data_mut().user_invoked = true;
             let r = e.plugin.openidea_plugin_commands().call_run(
                 &mut *store,
                 id,
@@ -1824,6 +1893,55 @@ impl Runtime {
             Ok(v) => Ok(view_from_wit(v)),
             Err(e) => Err(CallError::Guest(e.into())),
         }
+    }
+
+    /// An on-demand category query, always non-interactive and bounded.
+    pub fn search(
+        &mut self,
+        category: &str,
+        query: &str,
+        limit: u32,
+        invocation: Invocation,
+    ) -> Result<crate::search::SearchPage, CallError> {
+        if self.exports.search.is_none() {
+            return Err(CallError::missing_export("search-provider"));
+        }
+        let result = self.call(invocation, Duration::from_secs(2), |e, store| {
+            let ctx = store.data_mut().new_invocation()?;
+            let r = e.search.as_ref().expect("checked").call_search(
+                &mut *store,
+                category,
+                query,
+                limit,
+                wasmtime::component::Resource::new_borrow(ctx.rep()),
+            );
+            store.data_mut().drop_invocation(ctx);
+            r
+        })?;
+        let page = result.map_err(|e| CallError::Guest(e.into()))?;
+        if page.items.len() > limit as usize {
+            return Err(CallError::Guest(GuestError::Invalid("too many search results".into())));
+        }
+        Ok(crate::search::SearchPage {
+            has_more: page.has_more,
+            items: page
+                .items
+                .into_iter()
+                .map(|i| crate::search::SearchItem {
+                    id: i.id,
+                    title: i.title,
+                    description: i.description,
+                    target: match i.target {
+                        wit_search::SearchTarget::Location(l) => {
+                            crate::search::SearchTarget::Location(location_from_wit(l))
+                        }
+                        wit_search::SearchTarget::Command(c) => {
+                            crate::search::SearchTarget::Command { id: c.id, arg: c.arg }
+                        }
+                    },
+                })
+                .collect(),
+        })
     }
 
     /// Project routes, with an explicit project invocation and background budget.
@@ -1909,12 +2027,12 @@ impl Runtime {
         if self.exports.views.is_none() {
             return Err(CallError::missing_export("view-provider"));
         }
-        let net_interactive = !matches!(&event, ViewEvent::Message { .. });
+        let user_invoked = !matches!(&event, ViewEvent::Message { .. });
         let event = event_to_wit_view(event);
         let result = self.call(invocation, self.limits.timeout, |e, store| {
             let ctx = store.data_mut().new_invocation()?;
             store.data_mut().interactive = true;
-            store.data_mut().net_interactive = net_interactive;
+            store.data_mut().user_invoked = user_invoked;
             let views = e.views.as_ref().expect("checked");
             let r = views.call_handle(&mut *store, view, &event, wasmtime::component::Resource::new_borrow(ctx.rep()));
             store.data_mut().drop_invocation(ctx);
@@ -1966,7 +2084,7 @@ impl Runtime {
         let data = self.store.data_mut();
         data.invocation = Invocation::default();
         data.interactive = false;
-        data.net_interactive = false;
+        data.user_invoked = false;
         data.action_prompt_client = None;
         // Tasks don't outlive the call that began them.
         for id in std::mem::take(&mut data.open_tasks) {
@@ -2547,6 +2665,19 @@ fn gutter_action_from(v: wit_lf::GutterAction) -> crate::language_features::Gutt
         argument: v.argument.map(|v| crate::runtime::clip(v, 65536)),
     }
 }
+fn hover_action_from(v: wit_hia::HoverAction) -> crate::language_features::HoverAction {
+    crate::language_features::HoverAction {
+        line: v.line,
+        start_line: v.start_line,
+        end_line: v.end_line,
+        icon: v.icon.map(|v| crate::runtime::clip(v, 65536)),
+        label: crate::runtime::clip(v.label, 65536),
+        tooltip: v.tooltip.map(|v| crate::runtime::clip(v, 65536)),
+        command: crate::runtime::clip(v.command, 65536),
+        argument: v.argument.map(|v| crate::runtime::clip(v, 65536)),
+    }
+}
+
 fn parameter_label_from(v: wit_lf::ParameterLabel) -> crate::language_features::ParameterLabel {
     use crate::language_features::ParameterLabel as P;
     match v {
@@ -2775,6 +2906,30 @@ impl Runtime {
         let result = self.language_feature_call(timeout, |p, s| p.call_gutter_actions(s, &d))?;
         Ok(result.into_iter().take(10000).map(gutter_action_from).collect())
     }
+    pub fn has_hover_actions(&self) -> bool {
+        self.exports.hover_actions.is_some()
+    }
+
+    pub fn language_hover_actions(
+        &mut self,
+        doc: &ProviderDocument,
+        timeout: Duration,
+    ) -> Result<Vec<crate::language_features::HoverAction>, CallError> {
+        if self.exports.hover_actions.is_none() {
+            return Err(CallError::missing_export("hover-actions"));
+        }
+        let d = wit_hia::Document {
+            path: to_ipc(&doc.path),
+            language: doc.language.clone(),
+            version: doc.version,
+            text: doc.text.clone(),
+        };
+        let result = self.call(Invocation::default(), timeout, |exports, store| {
+            exports.hover_actions.as_ref().expect("checked").call_hover_actions(store, &d)
+        })?;
+        Ok(result.into_iter().take(10_000).map(hover_action_from).collect())
+    }
+
     pub fn provide_injections(
         &mut self,
         doc: &ProviderDocument,

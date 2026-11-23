@@ -12,11 +12,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 const BATCH_INTERVAL: Duration = Duration::from_millis(8);
 const BATCH_BYTES: usize = 64 * 1024;
+/// Size of one pipe read, so the most one queued [`Msg::Data`] holds.
+const READ_BUF: usize = 16 * 1024;
+/// Chunks the readers may queue ahead of the pump (at most `OUTPUT_QUEUE_CHUNKS * READ_BUF`,
+/// 2 MiB). A process printing faster than the console takes its output waits on its full
+/// pipe, as it would on a terminal, instead of piling the flood up in memory here.
+const OUTPUT_QUEUE_CHUNKS: usize = 128;
 /// After the main process exits, how long to wait for pipes still held by
 /// orphaned descendants before reporting the exit.
 const EXIT_DRAIN: Duration = Duration::from_millis(500);
@@ -112,6 +118,12 @@ enum Msg {
     Exited(Exit),
 }
 
+/// The queue from the readers (and the waiter) to the pump: bounded, so the readers wait
+/// while the pump is behind.
+fn output_queue() -> (SyncSender<Msg>, mpsc::Receiver<Msg>) {
+    mpsc::sync_channel(OUTPUT_QUEUE_CHUNKS)
+}
+
 /// The program and arguments actually executed, plus the echoed command line.
 pub(crate) struct Invocation {
     pub program: PathBuf,
@@ -165,7 +177,7 @@ fn shorten_java(inv: &mut Invocation, config: &RunConfig, cwd: &Path) -> IdeResu
         return Ok(TempFile(None));
     }
     let java = if inv.program.components().count() == 1 {
-        crate::which::find_executable(&inv.program.to_string_lossy(), &crate::wrap::search_path(config))
+        crate::which::find_executable(&inv.program.to_string_lossy(), &crate::wrap::search_path_in(config, cwd))
             .unwrap_or_else(|| inv.program.clone())
     } else {
         inv.program.clone()
@@ -229,6 +241,15 @@ fn match_console_encoding(
     fix.notice
 }
 
+/// A script without the execute bit as `/bin/sh <script>` (see [`ide_core::process::needs_sh`]).
+/// Applied last, so the encoding and Java fixes above still see the script itself.
+fn sh_for_unexecutable(inv: &mut Invocation) {
+    if !inv.shell && ide_core::process::needs_sh(&inv.program) {
+        let script = std::mem::replace(&mut inv.program, "/bin/sh".into());
+        inv.args.insert(0, script.to_string_lossy().into_owned());
+    }
+}
+
 /// A launch's pathing jar / argfile, deleted when dropped (the process exited, or never started).
 struct TempFile(Option<PathBuf>);
 
@@ -271,7 +292,7 @@ fn resolve_program(command: &str, cwd: &Path, config: &RunConfig, windows: bool)
         return cwd.join(path);
     }
     if path.components().count() == 1 && path.is_relative() {
-        let search = crate::wrap::search_path(config);
+        let search = crate::wrap::search_path_in(config, cwd);
         let pathext = std::env::var("PATHEXT").ok();
         if windows {
             // As cmd.exe does: the run directory first, a name with an extension as is,
@@ -382,6 +403,7 @@ impl ProcessManager {
         let notice =
             if extras.emulate_terminal { None } else { match_console_encoding(&mut inv, &mut env, config, options) };
         let temp = shorten_java(&mut inv, config, &cwd)?;
+        sh_for_unexecutable(&mut inv);
         if extras.emulate_terminal && followup.is_some() {
             return Err(IdeError::invalid("Go build and run requires the output console"));
         }
@@ -474,7 +496,7 @@ impl ProcessManager {
 
         on_output(OutputChunk::System { text: format!("{}\n", inv.display) });
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = output_queue();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let result = (|| -> std::io::Result<()> {
@@ -554,13 +576,13 @@ impl ProcessManager {
         if env.clear {
             cmd.env_clear();
         } else {
-            for (k, v) in ide_core::process::host_env_fixes() {
+            for (k, v) in ide_core::process::host_env_fixes_in(cwd) {
                 match v {
                     Some(v) => cmd.env(k, v),
                     None => cmd.env_remove(k),
                 }
             }
-            for (k, v) in ide_core::process::shell_env() {
+            for (k, v) in ide_core::process::shell_env_in(cwd) {
                 cmd.env(k, v);
             }
         }
@@ -621,7 +643,7 @@ impl ProcessManager {
         self.register(entry.clone());
         on_output(OutputChunk::System { text: format!("{}\n", inv.display) });
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = output_queue();
         let result = spawn_reader(
             id,
             Stream::Stdout,
@@ -771,6 +793,13 @@ impl ProcessManager {
         self.runs.lock().values().map(|e| e.info()).collect()
     }
 
+    /// The runs started for the project at `root` (that root exactly) that have not exited.
+    pub fn running_in(&self, root: &Path) -> Vec<RunInfo> {
+        let runs = self.runs.lock();
+        let live = runs.values().filter(|e| e.project_root == root && !e.exited.load(Ordering::Acquire));
+        live.map(|e| e.info()).collect()
+    }
+
     /// Kills every running process tree at once (shutting down).
     pub fn kill_project(&self, root: &Path) {
         for entry in self.runs.lock().values().filter(|e| e.project_root == root) {
@@ -807,7 +836,7 @@ fn run_followup(
     config: &RunConfig,
     cwd: &Path,
     entry: &Entry,
-    tx: &Sender<Msg>,
+    tx: &SyncSender<Msg>,
 ) -> std::io::Result<ExitStatus> {
     let mut pid = entry.pid.lock();
     if entry.stopping.load(Ordering::Acquire) {
@@ -910,7 +939,7 @@ fn launch_env(root: &Path, config: &RunConfig) -> IdeResult<LaunchEnv> {
         BTreeMap::new()
     } else {
         let base: BTreeMap<String, String> =
-            if extras.include_system_env { crate::system_env() } else { BTreeMap::new() };
+            if extras.include_system_env { crate::system_env_in(root) } else { BTreeMap::new() };
         let paths: Vec<PathBuf> = extras.env_files.iter().map(|f| resolve_cwd(root, Some(Path::new(f)))).collect();
         crate::envfile::load(&paths, &base).map_err(|e| IdeError::not_found(format!("cannot read .env file: {e}")))?
     };
@@ -921,22 +950,33 @@ fn launch_env(root: &Path, config: &RunConfig) -> IdeResult<LaunchEnv> {
         vars.insert("PYTHONUNBUFFERED".into(), "1".into());
     }
     vars.extend(config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    Ok(LaunchEnv { clear: !extras.include_system_env, vars })
+    let mut env = LaunchEnv { clear: !extras.include_system_env, vars };
+    // `npm.cmd` is found on the login-shell and Windows user PATH, then started by its
+    // full path. The script it runs (`node …`) only sees this process's PATH, which
+    // does not include that directory, so `node` is not recognized.
+    let cwd = resolve_cwd(root, config.cwd.as_deref());
+    if !env.clear && !env.vars.keys().any(|k| k.eq_ignore_ascii_case("PATH")) {
+        let path = crate::wrap::search_path_in(config, &cwd);
+        if let Some(text) = path.to_str().filter(|s| !s.is_empty()) {
+            env.vars.insert("PATH".into(), text.to_owned());
+        }
+    }
+    Ok(env)
 }
 
-/// What a run inherits with "Include system environment variables" on: this process's
-/// variables and the login shell's ones it lacks.
-pub(crate) fn inherited_env() -> BTreeMap<String, String> {
-    let mut vars = crate::system_env();
+/// What a run in the project at `root` inherits with "Include system environment variables"
+/// on: this process's variables, the login shell's ones it lacks and the project's own.
+pub(crate) fn inherited_env(root: &Path) -> BTreeMap<String, String> {
+    let mut vars = crate::system_env_in(root);
     vars.extend(
-        ide_core::process::shell_env().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        ide_core::process::shell_env_in(root).filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
     );
     vars
 }
 
 pub(crate) fn resolved_env(root: &Path, config: &RunConfig) -> IdeResult<BTreeMap<String, String>> {
     let env = launch_env(root, config)?;
-    let mut vars = if env.clear { BTreeMap::new() } else { inherited_env() };
+    let mut vars = if env.clear { BTreeMap::new() } else { inherited_env(root) };
     vars.extend(env.vars);
     Ok(vars)
 }
@@ -945,7 +985,12 @@ fn apply_env(cmd: &mut Command, env: &LaunchEnv) {
     if env.clear {
         cmd.env_clear();
     } else {
-        ide_core::process::host_env(cmd).envs(ide_core::process::shell_env());
+        // `host_env` picks the project's environment from the working directory, set by now.
+        let shell: Vec<_> = match cmd.get_current_dir() {
+            Some(dir) => ide_core::process::shell_env_in(dir).collect(),
+            None => ide_core::process::shell_env().collect(),
+        };
+        ide_core::process::host_env(cmd).envs(shell);
     }
     cmd.envs(&env.vars);
 }
@@ -1073,16 +1118,19 @@ fn kill_tree(entry: &Entry, pid: u32, _force: bool) {
         .status();
 }
 
+/// Reads `pipe` into `tx` until EOF. It waits in `send` while the pump is a full queue behind
+/// (the process then waits on its pipe). The pump dropping its receiver fails the `send`
+/// and ends the reader, so no reader stays blocked once the pump is gone.
 fn spawn_reader(
     id: RunId,
     stream: Stream,
     mut pipe: impl Read + Send + 'static,
-    tx: Sender<Msg>,
+    tx: SyncSender<Msg>,
     #[cfg(unix)] mut wait_readable: Option<Box<dyn FnMut() -> std::io::Result<()> + Send>>,
 ) -> std::io::Result<()> {
     let label = if stream == Stream::Stdout { "out" } else { "err" };
     std::thread::Builder::new().name(format!("openidea-run-{label}-{}", id.0)).spawn(move || {
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; READ_BUF];
         loop {
             match pipe.read(&mut buf) {
                 Ok(0) => break,
@@ -1391,6 +1439,75 @@ fn input_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[cfg(unix)]
+    #[test]
+    fn scripts_without_the_execute_bit_run_through_sh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gradlew");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let inv = || Invocation {
+            program: script.clone(),
+            args: vec!["build".into()],
+            raw_args: false,
+            shell: false,
+            display: "./gradlew build".into(),
+        };
+        let mut plain = inv();
+        sh_for_unexecutable(&mut plain);
+        assert_eq!(plain.program, PathBuf::from("/bin/sh"));
+        assert_eq!(plain.args, [script.to_string_lossy().as_ref(), "build"]);
+        assert_eq!(plain.display, "./gradlew build");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut executable = inv();
+        sh_for_unexecutable(&mut executable);
+        assert_eq!(executable.program, script);
+        // Not a `#!` script (a binary that lost its mode): left to fail as it is.
+        std::fs::write(&script, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut binary = inv();
+        sh_for_unexecutable(&mut binary);
+        assert_eq!(binary.program, script);
+    }
+
+    fn bare_config(env: BTreeMap<String, String>) -> RunConfig {
+        RunConfig {
+            id: "c".into(),
+            name: "c".into(),
+            kind: "npm".into(),
+            command: "npm".into(),
+            args: vec!["run".into(), "start".into()],
+            cwd: None,
+            env,
+            detected: true,
+            is_test: false,
+            debug_adapter: None,
+            allow_parallel: false,
+            extras: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_run_inherits_the_path_used_to_resolve_its_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = bare_config(BTreeMap::new());
+        let env = launch_env(dir.path(), &config).unwrap();
+        let path = env.vars.get("PATH").expect("child PATH");
+        let search = crate::wrap::search_path_in(&config, dir.path());
+        assert_eq!(path, search.to_str().unwrap());
+    }
+
+    #[test]
+    fn an_explicit_path_override_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = bare_config(BTreeMap::from([("Path".into(), r"C:\tools".into())]));
+        let env = launch_env(dir.path(), &config).unwrap();
+        assert_eq!(env.vars.get("Path").map(String::as_str), Some(r"C:\tools"));
+        assert_eq!(env.vars.keys().filter(|k| k.eq_ignore_ascii_case("PATH")).count(), 1);
+    }
 
     #[test]
     fn shell_lines_use_cmd_verbatim_on_windows() {
@@ -1467,5 +1584,110 @@ mod tests {
         // Relative paths resolve against the run directory on every platform.
         assert_eq!(resolve_program("./gradlew", cwd, &config, true), cwd.join("./gradlew"));
         assert_eq!(resolve_program(".venv/bin/python", cwd, &config, false), cwd.join(".venv/bin/python"));
+    }
+
+    /// A pipe stand-in that counts the bytes taken from it.
+    struct Counted<R> {
+        inner: R,
+        taken: Arc<AtomicUsize>,
+    }
+
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.taken.fetch_add(n, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_pump_holds_a_flooding_process_back_instead_of_queueing_its_output() {
+        const LINES: usize = 2_000_000;
+        // (Not `seq`: macOS prints large numbers in exponent form.)
+        let mut child = Command::new("awk")
+            .arg(format!("BEGIN{{for(i=1;i<={LINES};i++)print i}}"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("awk");
+        let taken = Arc::new(AtomicUsize::new(0));
+        let pipe = Counted { inner: child.stdout.take().unwrap(), taken: taken.clone() };
+        let (tx, rx) = output_queue();
+        spawn_reader(RunId::next(), Stream::Stdout, pipe, tx, None).unwrap();
+        let (mut received, mut peak, mut all) = (0usize, 0usize, Vec::new());
+        loop {
+            match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(Msg::Data(stream, bytes)) => {
+                    assert!(stream == Stream::Stdout);
+                    // Read from the pipe but not yet handled: the queue, plus the chunk the
+                    // reader holds while it waits for room, plus the one just received.
+                    peak = peak.max(taken.load(Ordering::SeqCst) - received);
+                    received += bytes.len();
+                    all.extend_from_slice(&bytes);
+                    // A console that cannot keep up with the process.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(Msg::Exited(_)) => unreachable!("only the waiter sends the exit"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("the reader stalled"),
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        let bound = (OUTPUT_QUEUE_CHUNKS + 2) * READ_BUF;
+        assert!(peak <= bound, "{peak} bytes queued ahead of the pump, more than {bound}");
+        let expected: String = (1..=LINES).map(|n| format!("{n}\n")).collect();
+        assert!(all == expected.as_bytes(), "the output arrived incomplete or out of order");
+    }
+
+    /// Endless output (cut at a size an unbounded queue could still hold in a test) that
+    /// reports when it is dropped, which is when the reader thread owning it ends.
+    struct Endless {
+        served: Arc<AtomicUsize>,
+        gone: mpsc::Sender<()>,
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.served.load(Ordering::SeqCst) >= 8 * OUTPUT_QUEUE_CHUNKS {
+                return Ok(0);
+            }
+            self.served.fetch_add(1, Ordering::SeqCst);
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    impl Drop for Endless {
+        fn drop(&mut self) {
+            let _ = self.gone.send(());
+        }
+    }
+
+    #[test]
+    fn a_reader_blocked_on_a_full_queue_ends_when_the_pump_is_gone() {
+        let served = Arc::new(AtomicUsize::new(0));
+        let (gone_tx, gone) = mpsc::channel();
+        let (tx, rx) = output_queue();
+        spawn_reader(
+            RunId::next(),
+            Stream::Stdout,
+            Endless { served: served.clone(), gone: gone_tx },
+            tx,
+            #[cfg(unix)]
+            None,
+        )
+        .unwrap();
+        // A pump that takes nothing: the queue fills and the reader holds one more chunk.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while served.load(Ordering::SeqCst) < OUTPUT_QUEUE_CHUNKS + 1 {
+            assert!(Instant::now() < deadline, "the reader never filled the queue");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Time for a reader that does not wait to run ahead.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(served.load(Ordering::SeqCst), OUTPUT_QUEUE_CHUNKS + 1, "the reader ran past the full queue");
+        assert!(gone.try_recv().is_err(), "the reader ended while its pump was still there");
+        drop(rx);
+        gone.recv_timeout(Duration::from_secs(30)).expect("the reader stayed blocked after the pump was gone");
     }
 }

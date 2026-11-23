@@ -24,8 +24,17 @@ import {
   type CompletionResult,
   type CompletionSource,
 } from "@codemirror/autocomplete";
-import { ChangeSet, EditorSelection, EditorState, Prec, StateEffect, StateField, type Text } from "@codemirror/state";
-import { EditorView, ViewPlugin, keymap, type Rect, type ViewUpdate } from "@codemirror/view";
+import { EditorSelection, EditorState, Prec, StateEffect, StateField, type Text } from "@codemirror/state";
+import {
+  EditorView,
+  ViewPlugin,
+  getTooltip,
+  keymap,
+  repositionTooltips,
+  showTooltip,
+  type Rect,
+  type ViewUpdate,
+} from "@codemirror/view";
 import {
   call,
   commands,
@@ -59,6 +68,8 @@ import { showHint } from "./hint";
 import { inplaceRenameActive } from "./inplaceRename";
 import { languageSemantics } from "./semantic";
 import { remoteChange } from "@/editor/api";
+import { tooltipBounds } from "@/editor/core/cm/setup";
+import { completionLabelOffset } from "./theme";
 
 interface RequestContext {
   doc: number;
@@ -268,10 +279,11 @@ export function applyLspCompletion(
     .map((c) => ({ from: mapOld(c.from), to: mapOld(c.to), insert: c.insert }))
     .filter((c) => c.to <= start || c.from >= end);
 
-  if (applyAtCarets(view, completion, item, start, end, extra)) {
+  const atCarets = applyAtCarets(view, completion, item, start, end, extra);
+  if (atCarets) {
     if (item === completion.lsp && !item.additionalEdits.length && item.data != null)
       void applyLateEdits(view, completion, start);
-    runCommand(view, item);
+    runCommand(view, item, atCarets === true ? [] : atCarets);
     return;
   }
 
@@ -331,6 +343,7 @@ export function applyLspCompletion(
  * caret's (the typed prefix, and what a replacing edit overwrites), as IDEA completes at all
  * carets. Snippets go in as plain text with the caret at their first stop, since fields cannot
  * be edited at several places at once. False with a single caret, or no other caret matches.
+ * For an item its server inserts: the other carets the server's edit is to be repeated at.
  */
 function applyAtCarets(
   view: EditorView,
@@ -339,13 +352,20 @@ function applyAtCarets(
   start: number,
   end: number,
   extra: { from: number; to: number; insert: string }[],
-): boolean {
+): boolean | number[] {
   const state = view.state;
   const { ranges, mainIndex } = state.selection;
   if (ranges.length < 2) return false;
-  // The server inserts the item at the main caret; `caretAfterServerInsert` repeats it at the others.
-  if (serverInserts(item)) return true;
   const head = state.selection.main.head;
+  // The server inserts the item at the main caret; `caretAfterServerInsert` repeats it at the
+  // others that have the same text before them.
+  if (serverInserts(item)) {
+    const prefix = state.sliceDoc(start, head);
+    return ranges
+      .filter((r, i) => i !== mainIndex && r.empty && r.head >= prefix.length)
+      .filter((r) => state.sliceDoc(r.head - prefix.length, r.head) === prefix)
+      .map((r) => r.head);
+  }
   if (head < start || head > end) return false;
   const prefix = state.sliceDoc(start, head);
   const suffix = state.sliceDoc(head, end);
@@ -364,19 +384,21 @@ function applyAtCarets(
   for (let i = 1; i < sites.length; i++) if (sites[i]!.from < sites[i - 1]!.to) return false;
   if (extra.some((c) => sites.some((site) => c.from < site.to && c.to > site.from))) return false;
 
-  let text: string;
-  let caret: number;
-  if (item.isSnippet) {
-    ({ text, caret } = lspSnippetToPlainWithCaret(item.insertText, snippetVariables(completion.req.path)));
-  } else {
+  // Parentheses depend on what follows each site: `a.cr|` gets them, `b.cr|()` does not.
+  const textAt = (site: { from: number; to: number }): { text: string; caret: number } => {
+    if (item.isSnippet) return lspSnippetToPlainWithCaret(item.insertText, snippetVariables(completion.req.path));
     const parens = editorPrefs().completion.insertParentheses
-      ? callParens(item, state.doc.lineAt(start), start, end)
+      ? callParens(item, state.doc.lineAt(site.from), site.from, site.to)
       : null;
-    text = item.insertText + (parens ? "()" : "");
-    caret = text.length - (parens === "inside" ? 1 : 0);
-  }
-  const changes = state.changes([...extra, ...sites.map((site) => ({ from: site.from, to: site.to, insert: text }))]);
-  const cursors = sites.map((site) => EditorSelection.cursor(changes.mapPos(site.from, -1) + caret));
+    const text = item.insertText + (parens ? "()" : "");
+    return { text, caret: text.length - (parens === "inside" ? 1 : 0) };
+  };
+  const texts = sites.map(textAt);
+  const changes = state.changes([
+    ...extra,
+    ...sites.map((site, i) => ({ from: site.from, to: site.to, insert: texts[i]!.text })),
+  ]);
+  const cursors = sites.map((site, i) => EditorSelection.cursor(changes.mapPos(site.from, -1) + texts[i]!.caret));
   view.dispatch({
     changes,
     selection: EditorSelection.create(
@@ -433,16 +455,60 @@ async function applyLateEdits(view: EditorView, c: LspCompletion, insertedAt: nu
   view.dispatch({ changes: edits, userEvent: "input.complete" });
 }
 
-/** Where the caret was when an item its server inserts was picked, until that edit lands (`null`: none). */
-const awaitServerInsert = StateEffect.define<number | null>();
-const serverInsertAt = StateField.define<number | null>({
+/**
+ * Where the caret was when an item its server inserts was picked, and the other carets to
+ * repeat the edit at, until that edit lands (`null`: none).
+ */
+interface ServerInsert {
+  at: number;
+  others: readonly number[];
+  /** The item is a call that takes arguments: the caret goes inside an inserted `()`. */
+  inside?: boolean;
+}
+const awaitServerInsert = StateEffect.define<ServerInsert | null>();
+const serverInsertAt = StateField.define<ServerInsert | null>({
   create: () => null,
-  update(at, tr) {
+  update(value, tr) {
     for (const e of tr.effects) if (e.is(awaitServerInsert)) return e.value;
     // The edit landed, or the caret moved on before it did.
-    if (at === null || tr.annotation(remoteChange) || tr.selection) return null;
-    return tr.changes.mapPos(at, -1);
+    if (value === null || tr.annotation(remoteChange) || tr.selection) return null;
+    return {
+      at: tr.changes.mapPos(value.at, -1),
+      others: value.others.map((p) => tr.changes.mapPos(p, -1)),
+      inside: value.inside,
+    };
   },
+});
+
+/** The server's edit repeated at other carets: applied as a local edit, so it reaches the document model. */
+const mirrorServerInsert = StateEffect.define<{
+  changes: { from: number; to: number; insert: string }[];
+  main: number;
+}>();
+const applyServerInsertMirror = EditorView.updateListener.of((u) => {
+  for (const tr of u.transactions)
+    for (const e of tr.effects) {
+      if (!e.is(mirrorServerInsert)) continue;
+      const { view } = u;
+      const doc = u.state.doc;
+      const { changes, main } = e.value;
+      queueMicrotask(() => {
+        if (!view.dom.isConnected || view.state.doc !== doc) return;
+        const mirror = view.state.changes(changes);
+        const cursors = [
+          { pos: mirror.mapPos(main, 1), main: true },
+          ...changes.map((c) => ({ pos: mirror.mapPos(c.from, -1) + c.insert.length, main: false })),
+        ].sort((a, b) => a.pos - b.pos);
+        view.dispatch({
+          changes: mirror,
+          selection: EditorSelection.create(
+            cursors.map((c) => EditorSelection.cursor(c.pos)),
+            cursors.findIndex((c) => c.main),
+          ),
+          userEvent: "input.complete",
+        });
+      });
+    }
 });
 
 /**
@@ -450,9 +516,18 @@ const serverInsertAt = StateField.define<number | null>({
  * completion (a remote insertion at the caret would otherwise leave it in front).
  */
 const caretAfterServerInsert = EditorState.transactionFilter.of((tr) => {
-  const at = tr.startState.field(serverInsertAt, false);
+  const pending = tr.startState.field(serverInsertAt, false);
+  const at = pending?.at;
   const caret = tr.startState.selection.main;
-  if (at == null || !tr.docChanged || !tr.annotation(remoteChange) || !caret.empty || caret.head !== at) return tr;
+  if (
+    pending == null ||
+    at == null ||
+    !tr.docChanged ||
+    !tr.annotation(remoteChange) ||
+    !caret.empty ||
+    caret.head !== at
+  )
+    return tr;
   let edit: { from: number; to: number; insert: string } | null = null;
   tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
     if (!edit && fromA <= at && toA >= at) edit = { from: fromA, to: toA, insert: inserted.toString() };
@@ -465,38 +540,32 @@ const caretAfterServerInsert = EditorState.transactionFilter.of((tr) => {
   const before = at - landed.from;
   const after = landed.to - at;
   const others: { from: number; to: number }[] = [];
-  for (const r of tr.startState.selection.ranges) {
-    if (r === caret || !r.empty) continue;
-    const from = r.head - before;
-    const to = r.head + after;
+  for (const head of pending.others) {
+    const from = head - before;
+    const to = head + after;
     if (from < 0 || to > tr.startState.doc.length || tr.startState.sliceDoc(from, to) !== replaced) continue;
     if (tr.changes.touchesRange(from, to)) continue;
     others.push({ from: tr.changes.mapPos(from, 1), to: tr.changes.mapPos(to, -1) });
   }
-  if (!others.length) return [tr, { selection: EditorSelection.cursor(mainAfter), sequential: true }];
-  const mirror = ChangeSet.of(
-    others.map((o) => ({ from: o.from, to: o.to, insert: landed.insert })),
-    tr.newDoc.length,
-  );
-  const cursors = [
-    { pos: mirror.mapPos(mainAfter, 1), main: true },
-    ...others.map((o) => ({ pos: mirror.mapPos(o.from, -1) + landed.insert.length, main: false })),
-  ].sort((a, b) => a.pos - b.pos);
-  return [
-    tr,
-    {
-      changes: mirror,
-      selection: EditorSelection.create(
-        cursors.map((c) => EditorSelection.cursor(c.pos)),
-        cursors.findIndex((c) => c.main),
-      ),
-      sequential: true,
-    },
-  ];
+  const inside =
+    pending.inside && /\(\)$/.test(landed.insert) && tr.newDoc.sliceString(mainAfter - 2, mainAfter) === "()";
+  const selection = EditorSelection.cursor(inside ? mainAfter - 1 : mainAfter);
+  if (!others.length) return [tr, { selection, sequential: true }];
+  // Not part of this transaction: a remote one is not sent back to the document model.
+  const changes = others
+    .sort((a, b) => a.from - b.from)
+    .map((o) => ({ from: o.from, to: o.to, insert: landed.insert }));
+  return [tr, { selection, effects: mirrorServerInsert.of({ changes, main: mainAfter }), sequential: true }];
 });
 
 /** Client-side commands handled by the editor itself (VS Code ids servers commonly send). */
 const CLIENT_COMMANDS = new Set(["editor.action.triggerParameterHints", "editor.action.triggerSuggest"]);
+
+/** A function or method whose signature lists parameters (`(name: String)`), as far as the item tells. */
+function takesArguments(item: Pick<CompletionItem, "kind" | "labelDetail" | "detail">): boolean {
+  if (item.kind && !CALLABLE.has(item.kind)) return false;
+  return /^\s*\(\s*[^)\s]/.test(item.labelDetail ?? item.detail ?? "");
+}
 
 /** kotlin-lsp inserts the item itself (`jetbrains.kotlin.completion.apply`): nothing goes in here. */
 function serverInserts(item: CompletionItem): boolean {
@@ -504,12 +573,15 @@ function serverInserts(item: CompletionItem): boolean {
   return !!cmd && !item.insertText && !CLIENT_COMMANDS.has(cmd) && !cmd.startsWith("editor.");
 }
 
-function runCommand(view: EditorView, item: CompletionItem) {
+function runCommand(view: EditorView, item: CompletionItem, others: readonly number[] = []) {
   const command = item.command;
   if (!command?.command) return;
   const cmd = command.command;
   const serverInserted = serverInserts(item);
-  if (serverInserted) view.dispatch({ effects: awaitServerInsert.of(view.state.selection.main.head) });
+  if (serverInserted)
+    view.dispatch({
+      effects: awaitServerInsert.of({ at: view.state.selection.main.head, others, inside: takesArguments(item) }),
+    });
   if (cmd === "editor.action.triggerParameterHints") setTimeout(() => triggerSignatureHelp(view), 0);
   else if (cmd === "editor.action.triggerSuggest") setTimeout(() => startCompletion(view), 0);
   else if (!CLIENT_COMMANDS.has(cmd) && !cmd.startsWith("editor.")) {
@@ -855,12 +927,18 @@ const lookupTracker = ViewPlugin.fromClass(
         if (options.length === 1 && editorPrefs().completion.autoInsertSingle) {
           const doc = u.state.doc;
           setTimeout(() => {
-            const now = currentCompletions(view.state);
+            const state = view.state;
+            const now = currentCompletions(state);
+            const { head } = state.selection.main;
+            const line = state.doc.lineAt(head);
+            const column = head - line.from;
+            // Keep the lookup open so Tab can replace the remaining identifier.
             if (
-              view.state.doc === doc &&
-              completionStatus(view.state) === "active" &&
+              state.doc === doc &&
+              completionStatus(state) === "active" &&
               now.length === 1 &&
-              now[0] === options[0]
+              now[0] === options[0] &&
+              identifierEnd(line.text, column) === column
             )
               acceptCompletion(view);
           }, AUTO_INSERT_DELAY);
@@ -870,7 +948,7 @@ const lookupTracker = ViewPlugin.fromClass(
   },
 );
 
-/** ⌃Space: explicit completion (a focused lookup; a sole candidate is inserted at once). */
+/** ⌃Space: explicit completion with a focused lookup. */
 export function explicitCompletion(view: EditorView): boolean {
   explicitPending.add(view);
   const started = startCompletion(view);
@@ -933,36 +1011,49 @@ function sortToggle(view: EditorView): HTMLElement {
   return button;
 }
 
-/** IDEA's advertiser bar under the list (one tip: "Press ↵ to insert, ⇥ to replace") and its Sort by Name toggle. */
-const completionFooter = ViewPlugin.fromClass(
+const completionPopup = ViewPlugin.fromClass(
   class {
     constructor(private view: EditorView) {}
     update(u: ViewUpdate) {
-      if (completionStatus(u.state) !== "active") return;
+      // The lookup can show partial results while another source is still pending.
+      const popup = u.state
+        .facet(showTooltip)
+        .map((tooltip) => tooltip && getTooltip(this.view, tooltip))
+        .find((tooltip) => tooltip?.dom.classList.contains("cm-lsp-completion"));
+      if (!popup) return;
+      popup.offset ??= { x: -completionLabelOffset, y: 0 };
+      const t = popup.dom;
       this.view.requestMeasure({
-        read: () => null,
-        write: () => {
-          const scope = this.view.dom.ownerDocument;
-          const tooltips = [
-            ...this.view.dom.querySelectorAll<HTMLElement>(".cm-tooltip-autocomplete"),
-            ...scope.querySelectorAll<HTMLElement>(".cm-tooltip-autocomplete"),
-          ];
-          for (const t of tooltips) {
-            let footer = t.querySelector<HTMLElement>(":scope > .cm-lsp-completion-footer");
-            if (footer) {
-              // CodeMirror rebuilds the option list by appending a fresh <ul>,
-              // which would leave an existing footer above the list.
-              const list = t.querySelector(":scope > ul");
-              if (list && list.nextElementSibling !== footer) list.after(footer);
-              continue;
-            }
+        key: this,
+        read: () => {
+          const { left, right } = tooltipBounds(this.view);
+          return {
+            width: `${Math.max(0, Math.floor(right - left))}px`,
+            fontSize: getComputedStyle(this.view.contentDOM).fontSize,
+          };
+        },
+        write: ({ width, fontSize }) => {
+          if (!t.isConnected) return;
+          const widthChanged = t.style.getPropertyValue("--cm-completion-max-width") !== width;
+          if (widthChanged) t.style.setProperty("--cm-completion-max-width", width);
+          // The body-level tooltip does not inherit the editor's temporary font zoom.
+          const fontChanged = t.style.getPropertyValue("--openidea-editor-font-size") !== fontSize;
+          if (fontChanged) t.style.setProperty("--openidea-editor-font-size", fontSize);
+          let footer = t.querySelector<HTMLElement>(":scope > .cm-lsp-completion-footer");
+          if (!footer) {
             footer = document.createElement("div");
             footer.className = "cm-lsp-completion-footer";
             const tip = document.createElement("span");
             tip.textContent = tx("Press ↵ to insert, ⇥ to replace");
+            tip.title = tip.textContent;
             footer.append(tip, sortToggle(this.view));
-            t.appendChild(footer);
           }
+          // CodeMirror appends a fresh list when the candidates change.
+          const list = t.querySelector(":scope > ul");
+          const footerMoved = list && list.nextElementSibling !== footer;
+          if (footerMoved) list.after(footer);
+          // CodeMirror has already measured the lookup. Reposition it before this frame paints.
+          if (widthChanged || fontChanged || footerMoved) repositionTooltips(this.view);
         },
       });
     }
@@ -1017,10 +1108,11 @@ export function completionExtension() {
       tooltipClass: () => "cm-lsp-completion",
       positionInfo: positionCompletionInfo,
     }),
-    completionFooter,
+    completionPopup,
     lookupTracker,
     serverInsertAt,
     caretAfterServerInsert,
+    applyServerInsertMirror,
     Prec.highest(
       keymap.of([
         // macOS: ⌃N / ⌃P are line down / up in text, so they move through the lookup as ↓ / ↑ do.

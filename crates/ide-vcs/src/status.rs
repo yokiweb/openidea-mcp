@@ -20,11 +20,45 @@ pub(crate) fn status(r: &Repo) -> IdeResult<Vec<FileStatus>> {
     let ignored = r.ignored.read().unwrap_or_else(|p| p.into_inner()).clone();
     // gitoxide stops at the first IO error (a directory it may not read), where git warns
     // and lists the rest: git answers then.
-    let (map, conflicts) = gix_status(r, &ignored).or_else(|e| {
-        tracing::debug!("status via gitoxide failed, asking git: {}", e.message);
-        cli_status(r, &ignored)
-    })?;
+    let (map, conflicts) = if r.cli_status.load(std::sync::atomic::Ordering::Acquire) {
+        cli_status(r, &ignored)?
+    } else {
+        gix_status(r, &ignored).or_else(|e| {
+            tracing::debug!("status via gitoxide failed, asking git: {}", e.message);
+            cli_status(r, &ignored)
+        })?
+    };
     Ok(collect(r, &ignored, map, conflicts))
+}
+
+/// Git-ignored working-tree entries, with ignored directories reported as one entry each.
+pub(crate) fn ignored_files(r: &Repo) -> IdeResult<Vec<FileStatus>> {
+    let ignored = r.ignored.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let overrides = crate::cli::filter_overrides(r.root(), &ide_core::CancellationToken::new())?;
+    let mut args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+    args.extend([
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=normal",
+        "--ignored=matching",
+        "--no-renames",
+        "--ignore-submodules=all",
+    ]);
+    let output = crate::cli::run_env(r.root(), &args, None, &read_only())?;
+    Ok(output
+        .stdout
+        .split(|b| *b == 0)
+        .filter_map(|record| std::str::from_utf8(record.strip_prefix(b"! ")?).ok())
+        .filter(|rel| !rel.is_empty() && !ignored.is_ignored_path(rel))
+        .map(|rel| FileStatus {
+            path: r.abs_path(rel).into(),
+            rel_path: rel.into(),
+            staged: None,
+            unstaged: Some(ChangeKind::Ignored),
+            renamed_from: None,
+        })
+        .collect())
 }
 
 /// Status of `paths` only (repository-relative, `/`-separated): the dirty-scope refresh.
@@ -206,9 +240,11 @@ fn gix_status(r: &Repo, ignored: &IgnoredNames) -> IdeResult<Entries> {
             }
         }
     }
+    // Gitoxide's index writer omits resolve-undo data. Keep those saved conflicts.
     // Serialize write-back and identity capture with watcher queries.
     if let Some(mut outcome) = iter.into_outcome()
         && outcome.has_changes()
+        && outcome.worktree_index.resolve_undo().is_none()
     {
         let mut writes = crate::index_writes::lock();
         // Another process rewrote the index while this status run was reading it
@@ -231,6 +267,12 @@ fn gix_status(r: &Repo, ignored: &IgnoredNames) -> IdeResult<Entries> {
     Ok((map, conflicts))
 }
 
+/// Keeps `git status` from rewriting the index with refreshed stat data. Such a write is not
+/// one of ours to the watcher, so it would schedule another refresh, which runs git again (#4792).
+fn read_only() -> [(&'static str, &'static std::ffi::OsStr); 1] {
+    [("GIT_OPTIONAL_LOCKS", std::ffi::OsStr::new("0"))]
+}
+
 /// `git status --porcelain=v2`: what git lists, unreadable directories skipped.
 /// In Restricted Mode git compares content without the repository's clean/process
 /// filters and doesn't ask submodules for their own status (which runs their config).
@@ -241,7 +283,7 @@ fn cli_status(r: &Repo, ignored: &IgnoredNames) -> IdeResult<Entries> {
     if !crate::execution_allowed() {
         args.push("--ignore-submodules=dirty");
     }
-    let out = crate::cli::run(r.root(), &args, None)?;
+    let out = crate::cli::run_env(r.root(), &args, None, &read_only())?;
     Ok(parse_porcelain_v2(&String::from_utf8_lossy(&out.stdout), ignored))
 }
 
@@ -256,7 +298,7 @@ fn cli_status_paths(r: &Repo, ignored: &IgnoredNames, paths: &[String]) -> IdeRe
     }
     args.push("--");
     args.extend(paths.iter().map(String::as_str));
-    let out = crate::cli::run(r.root(), &args, None)?;
+    let out = crate::cli::run_env(r.root(), &args, None, &read_only())?;
     Ok(parse_porcelain_v2(&String::from_utf8_lossy(&out.stdout), ignored))
 }
 
@@ -391,6 +433,29 @@ mod tests {
         // Nothing staged: HEAD and index agree.
         let staged = Command::new("git").current_dir(dir).args(["diff", "--cached", "--stat"]).output().unwrap();
         assert!(staged.stdout.is_empty(), "{}", String::from_utf8_lossy(&staged.stdout));
+    }
+
+    /// #4792: the dirty-scope `git status` must not rewrite the index after refreshing stale
+    /// stat data, or the watcher sees a foreign index write and refreshes again.
+    #[test]
+    fn git_status_of_paths_leaves_the_index_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test User"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        commit_all(dir, "base");
+        // Same content, new stat data: plain `git status` would refresh and write the index.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        let index = dir.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+
+        let repo = Repo::discover(dir).unwrap().expect("repository found");
+        assert!(status_paths(&repo, &["a.txt".to_owned()]).unwrap().is_empty());
+        assert_eq!(std::fs::read(&index).unwrap(), before, "git status rewrote the index");
     }
 
     /// git's porcelain answer (used when gitoxide can't read the tree) matches gitoxide's.

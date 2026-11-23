@@ -13,6 +13,8 @@ import type { BeforeLaunchTask, RunConfig } from "@/platform/ipc";
 import { workflowSettings } from "@/platform/workflowSettings";
 import { notifications, toolWindowService, useContributions } from "@/workbench/contributions";
 import { externalToolConfig } from "./externalTools";
+import { toolWindowTitle } from "@/workbench/toolwindows/title";
+import { runConfigurationToCompletion } from "./configurationChecks";
 import { startRun, useRun } from "./store";
 
 export const BUILD_ACTION = "build.buildProject";
@@ -56,15 +58,26 @@ export function taskLabel(task: BeforeLaunchTask, configs: readonly RunConfig[] 
       return `External tool '${workflowSettings().externalTools.find((t) => t.id === target)?.name ?? target}'`;
     case "command":
       return target ? `Run '${target}'` : "Run shell command";
-    case "toolWindow":
-      return `Activate '${useContributions.getState().toolWindows.get(target)?.title ?? target}' tool window`;
+    case "toolWindow": {
+      const tw = useContributions.getState().toolWindows.get(target);
+      return `Activate '${tw ? toolWindowTitle(tw) : target}' tool window`;
+    }
     default:
       return task.kind;
   }
 }
 
 /** Runs `config` to completion: true when it exited with code 0. */
-async function runToEnd(config: RunConfig, chain: readonly string[], show?: boolean): Promise<boolean> {
+async function runToEnd(
+  config: RunConfig,
+  chain: readonly string[],
+  show?: boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal) {
+    const results = await runConfigurationToCompletion(config, signal, chain);
+    return results.every((result) => result.exitCode === 0 && !result.failedTests);
+  }
   let done!: (ok: boolean) => void;
   const exited = new Promise<boolean>((resolve) => (done = resolve));
   const session = await startRun(config, undefined, undefined, {
@@ -81,6 +94,7 @@ async function runTask(
   config: RunConfig,
   chain: readonly string[],
   show?: boolean,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const target = task.target ?? "";
   switch (task.kind) {
@@ -113,14 +127,14 @@ async function runTask(
       const other = useRun.getState().configs.find((c) => c.id === target);
       if (!other) return `Configuration '${target}' no longer exists`;
       if (isCMakeBuild(other)) return buildCMake(other.id, show === true);
-      return (await runToEnd(other, chain, show)) ? null : `'${other.name}' failed`;
+      return (await runToEnd(other, chain, show, signal)) ? null : `'${other.name}' failed`;
     }
     case "tool": {
       const tool = workflowSettings().externalTools.find((t) => t.id === target);
       if (!tool) return `External tool '${target}' no longer exists`;
       const run = await externalToolConfig(tool);
       if (!run) return `'${tool.name}' was not run`;
-      return (await runToEnd({ ...run, id: `${run.id}:before:${config.id}` }, chain, show))
+      return (await runToEnd({ ...run, id: `${run.id}:before:${config.id}` }, chain, show, signal))
         ? null
         : `'${tool.name}' failed`;
     }
@@ -138,11 +152,11 @@ async function runTask(
         isTest: false,
         debugAdapter: null,
       };
-      return (await runToEnd(run, chain, show)) ? null : `'${target}' failed`;
+      return (await runToEnd(run, chain, show, signal)) ? null : `'${target}' failed`;
     }
     case "toolWindow": {
       if (!useContributions.getState().toolWindows.has(target)) return `Tool window '${target}' is not available`;
-      toolWindowService().show(target, true);
+      if (!signal) toolWindowService().show(target, true);
       return null;
     }
     default:
@@ -151,14 +165,21 @@ async function runTask(
 }
 
 /** The installed runner: every task in order; a failure is reported and aborts. */
-export async function runBeforeLaunch(config: RunConfig, chain: readonly string[], show?: boolean): Promise<boolean> {
+export async function runBeforeLaunch(
+  config: RunConfig,
+  chain: readonly string[],
+  show?: boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
   for (const task of config.beforeLaunch ?? []) {
+    signal?.throwIfAborted();
     let error: string | null;
     try {
-      error = await runTask(task, config, chain, show);
+      error = await runTask(task, config, chain, show, signal);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
+    signal?.throwIfAborted();
     if (error) {
       notifications().notify({
         group: "run",

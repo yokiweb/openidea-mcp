@@ -5,7 +5,7 @@
  */
 import { EditorSelection } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { activeEditor, editorsFor, whenSynced, type EditorDocContext } from "@/editor/api";
+import { openCodeLocation, activeEditor, editorsFor, whenSynced, type EditorDocContext } from "@/editor/api";
 import { docOf, lspRequest } from "@/editor/lsp/lsp";
 import { offsetToPos, posToOffset } from "@/editor/lsp/positions";
 import { caretAnchor, openPopup } from "@/editor/lsp/popupStore";
@@ -22,7 +22,7 @@ import { registerRelatedProvider, relatedItems } from "@/editor/relatedProviders
 import { gotoTestOrSubject, type TestNavDeps } from "./gotoTest";
 import { headerSourceItems } from "./headerSource";
 import { projectPythonHierarchy, pythonSuperDeps } from "./pythonHierarchy";
-import { baseName, memberAt, methodStop, superMethods, type SuperDeps } from "./structureNav";
+import { baseName, memberAt, methodStop, superMethods, topLevelTypeAt, type SuperDeps } from "./structureNav";
 import { tx } from "@/platform/i18n";
 
 const EDITOR_WHEN = "textEditorActive && (editorFocus || !toolWindowFocus)";
@@ -143,13 +143,17 @@ function testDeps(view: EditorView, ctx: EditorDocContext): TestNavDeps {
         items: items.map((it, i) => ({
           id: `${i}`,
           label: it.label,
-          detail: it.detail,
-          emphasis: it.emphasis,
-          icon: it.emphasis ? "plus" : fileIconName(it.label),
+          ...(it.kind === "create"
+            ? { icon: "plus", section: { id: "create-test" } }
+            : { icon: fileIconName(it.label), target: { container: null, path: it.detail } }),
           run: it.run,
         })),
       }),
     hint: (text) => showHint(view, text),
+    classAtCaret: async () => {
+      const outline = await call(commands.docOutline(ctx.doc));
+      return topLevelTypeAt(outline, offsetToPos(view.state.doc, view.state.selection.main.head))?.name ?? null;
+    },
     createTest: ({ directory, name, extension }) =>
       void executeAction("templates.newFromTemplate", { directory, name, extension, kindId: "test" }),
     createRustTestModule: () => {
@@ -213,10 +217,7 @@ async function gotoRelated(view: EditorView) {
     return;
   }
   const open = (item: (typeof items)[number]) =>
-    editorService().openFile(item.path, {
-      selection: item.line === undefined ? undefined : { line: item.line, col: item.col ?? 0 },
-      focus: true,
-    });
+    openCodeLocation(item.path, item.line === undefined ? undefined : { line: item.line, col: item.col ?? 0 });
   if (items.length === 1) {
     await open(items[0]!);
     return;

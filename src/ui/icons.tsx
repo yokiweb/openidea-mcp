@@ -1,7 +1,8 @@
 /**
  * Icon set: JetBrains new-UI ("expui") icons from intellij-community / intellij-plugins
  * (Apache-2.0 / MIT, see THIRD_PARTY_LICENSES.md), vendored as-is under
- * `./expui/<group>/<name>.svg` with their `_dark` and `@20x20` variants. File types
+ * `./expui/<group>/<name>.svg` with their `_dark` and `@20x20` variants; `./expui/flutter/`
+ * holds the Flutter plugin's tool window icons (BSD-3-Clause). File types
  * whose JetBrains icons are not open source use OpenIDEA's own icons drawn in the same
  * style, under `./openidea/<group>/<name>.svg` (paths prefixed `openidea/`). Project type
  * logos under `./brands/` come from Simple Icons (CC0-1.0; see THIRD_PARTY_LICENSES.md). Names are the
@@ -20,7 +21,7 @@
  * - Element ids (clip paths) are made unique per instance: WebKit can't resolve
  *   references into `display: none` subtrees, so ids must never be shared.
  */
-import { useId, useMemo, type CSSProperties } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, type CSSProperties } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
 import styles from "./icons.module.css";
@@ -104,6 +105,8 @@ const ICONS = {
   "file-text": "fileTypes/text",
   "file-json": "fileTypes/json",
   "file-md": "fileTypes/markdown",
+  "file-word": "openidea/fileTypes/word",
+  "file-pdf": "openidea/fileTypes/pdf",
   "file-image": "fileTypes/image",
   paperclip: "openidea/general/paperclip",
   image: "openidea/general/image",
@@ -178,6 +181,7 @@ const ICONS = {
   "file-godot": "openidea/fileTypes/godot",
   "file-gdshader": "openidea/fileTypes/gdshader",
   "file-asciidoc": "openidea/fileTypes/asciidoc",
+  "file-typst": "openidea/fileTypes/typst",
   "file-d": "openidea/fileTypes/d",
   "file-gherkin": "openidea/fileTypes/gherkin",
   "file-prisma": "openidea/fileTypes/prisma",
@@ -265,6 +269,7 @@ const ICONS = {
   "agent-kiro": "openidea/agents/kiro",
   "agent-vibe": "openidea/agents/vibe",
   "agent-omp": "openidea/agents/omp",
+  "agent-hermes": "openidea/agents/hermes",
   "agent-deepseek-harness": "brands/deepseek",
   "toolwindow-maven": "toolwindows/maven",
   "toolwindow-gradle": "toolwindows/gradle",
@@ -307,6 +312,7 @@ const ICONS = {
   "page-first": "openidea/general/pageFirst",
   "page-last": "openidea/general/pageLast",
   sliders: "openidea/general/sliders",
+  layers: "openidea/general/layers",
   "graphql-variables": "openidea/general/graphqlVariables",
   layout: "general/layout",
   split: "general/splitVertically",
@@ -381,6 +387,7 @@ const ICONS = {
   "db-foreign-key": "openidea/database/foreignKey",
   "db-index": "openidea/database/index",
   "db-schema": "openidea/database/schema",
+  "db-database": "openidea/database/database",
   "db-console": "openidea/database/console",
   "db-matview": "openidea/database/matview",
   "db-routine": "openidea/database/routine",
@@ -414,7 +421,10 @@ const ICONS = {
   "db-timescale": "openidea/database/timescale",
   "db-yugabyte": "openidea/database/yugabyte",
   export: "openidea/general/export",
+  artifact: "openidea/general/artifact",
   web: "openidea/general/web",
+  remote: "openidea/general/remote",
+  "file-new": "openidea/general/newFile",
   "browser-chrome": "openidea/browsers/chrome",
   "browser-chromium": "openidea/browsers/chromium",
   "browser-firefox": "openidea/browsers/firefox",
@@ -441,12 +451,17 @@ const ICONS = {
   "test-pending": "run/testNotRunYet",
   "test-show-passed": "run/showPassed",
   "test-show-ignored": "run/showIgnored",
+  "test-sort": "runConfigurations/sortByDuration",
   debug: "run/debug",
   "run-coverage": "run/runWithCoverage",
   profile: "run/profile",
   "toolwindow-coverage": "toolwindows/coverage",
   "toolwindow-profiler": "toolwindows/profiler",
   "toolwindow-logcat": "openidea/fileTypes/log",
+  "toolwindow-flutter-inspector": "flutter/inspector",
+  "toolwindow-flutter-devtools": "flutter/devTools",
+  "toolwindow-flutter-deep-links": "flutter/deepLinks",
+  "toolwindow-flutter-extensions": "flutter/extensions",
   "gutter-navigate": "general/autoscrollToSource",
   "gutter-run": "gutter/run",
   "gutter-run-all": "actions/runAll",
@@ -467,6 +482,9 @@ const ICONS = {
   "stop-filled": "run/stop_stroke",
   resume: "run/resume",
   pause: "run/pause",
+  "thread-running": "openidea/debugger/threadRunning",
+  "thread-suspended": "openidea/debugger/threadSuspended",
+  "thread-breakpoint": "openidea/debugger/threadBreakpoint",
   "step-over": "run/stepOver",
   "step-into": "run/stepInto",
   "step-out": "run/stepOut",
@@ -521,6 +539,8 @@ const ICONS = {
   "vcs-outgoing": "vcs/changesPush@12x12",
   diff: "vcs/diff",
   revert: "vcs/revert",
+  patch: "vcs/patch",
+  "cherry-pick": "vcs/cherryPick",
   // The merge tool's own controls (IntelliJ's AllIcons.Diff)
   "diff-side-by-side": "diff/sideBySide",
   "diff-unified": "diff/unified",
@@ -557,6 +577,8 @@ const ICONS = {
   "github-timeline": "github/timeline",
   "github-issue-open": "github/issueOpened",
   "github-issue-closed": "github/issueClosed",
+  "issue-open": "openidea/vcs/issueOpen",
+  "issue-closed": "openidea/vcs/issueClosed",
   "github-local-branch": "github/localBranch",
   "github-warning": "github/githubWarning",
   "add-emoji": "github/addEmoji",
@@ -824,6 +846,20 @@ const EMPTY: Prepared = { viewBox: "0 0 16 16", html: "", hasIds: false, mono: t
 
 const withIds = (p: Prepared, prefix: string) => (p.hasIds ? p.html.replace(/__ID__/g, prefix) : p.html);
 
+/** Parsed markup by source, cloned into each icon: a tree or list mounts dozens of the same icon
+ *  per frame, and parsing `innerHTML` for each one costs more than the rest of the row. */
+const parsed = new Map<string, SVGSVGElement>();
+
+function fillIcon(svg: SVGSVGElement, html: string, shared: boolean) {
+  let source = shared ? parsed.get(html) : undefined;
+  if (!source) {
+    source = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    source.innerHTML = html;
+    if (shared) parsed.set(html, source);
+  }
+  svg.replaceChildren(...Array.from(source.childNodes, (n) => n.cloneNode(true)));
+}
+
 // ---------------------------------------------------------------------------
 
 /** Largest `data:` image accepted as an icon (an avatar or a status badge a plugin fetched). */
@@ -872,11 +908,17 @@ function SvgIcon({ name, size = 16, className, style, label }: IconProps) {
   const path = iconPath(name);
   const p = (path && prepare(path, size >= 18)) || prepare(ICONS.file, size >= 18) || EMPTY;
   const html = useMemo(() => withIds(p, `i${uid.replace(/[^a-zA-Z0-9_-]/g, "")}-`), [p, uid]);
+  const ref = useRef<SVGSVGElement>(null);
+  useLayoutEffect(() => {
+    // Markup with per-instance ids is unique to this icon: nothing to share.
+    if (ref.current) fillIcon(ref.current, html, !p.hasIds);
+  }, [html, p.hasIds]);
   if (!path && name.startsWith("symbol-")) {
     return <SymbolBadge kind={name.slice(7)} className={className} style={style} />;
   }
   return (
     <svg
+      ref={ref}
       className={clsx(styles.icon, p.mono && styles.mono, className)}
       style={style}
       width={size}
@@ -887,7 +929,6 @@ function SvgIcon({ name, size = 16, className, style, label }: IconProps) {
       role={label ? "img" : undefined}
       aria-label={label}
       focusable="false"
-      dangerouslySetInnerHTML={{ __html: html }}
     />
   );
 }
@@ -1030,7 +1071,7 @@ const FILE_NAMES = table({
   "file-makefile": "makefile gnumakefile bsdmakefile makefile.am makefile.in kbuild",
   "file-cmake": "cmakelists.txt cmakecache.txt",
   "file-perl": "makefile.pl build.pl cpanfile",
-  "file-git": ".gitattributes .gitmodules .gitconfig .git-blame-ignore-revs .mailmap",
+  "file-git": ".gitattributes .gitmodules .gitconfig .git-blame-ignore-revs .mailmap .worktreeinclude",
   "file-ignored":
     ".gitignore .gitignore_global .dockerignore .npmignore .prettierignore .eslintignore .stylelintignore .hgignore .ignore .rgignore " +
     ".fdignore .helmignore .vscodeignore .gcloudignore .slugignore .cfignore .bzrignore .containerignore",
@@ -1096,6 +1137,8 @@ const EXT_ICONS = table({
   "file-astro": "astro",
   "file-json": "json jsonc json5 jsonl ndjson geojson topojson webmanifest har avsc code-workspace code-snippets map",
   "file-md": "md mdx markdown mdown mkd mkdn mdwn ronn workbook",
+  "file-word": "doc docx rtf odt",
+  "file-pdf": "pdf",
   "file-rst": "rst",
   "file-yaml": "yaml yml gotmpl",
   "file-toml": "toml",
@@ -1153,6 +1196,7 @@ const EXT_ICONS = table({
   "file-godot": "tscn tres godot import",
   "file-gdshader": "gdshader gdshaderinc",
   "file-asciidoc": "adoc asciidoc",
+  "file-typst": "typ",
   "file-d": "d di",
   "file-gherkin": "feature",
   "file-prisma": "prisma",

@@ -5,6 +5,7 @@
  */
 export const intellijWindows: Record<string, string[]> = {
   "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
+  "editor.createRectangularSelectionOnMouseDrag": ["Alt+Button1", "Button2"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": ["Ctrl+N"],
@@ -321,9 +322,17 @@ export const intellijWindows: Record<string, string[]> = {
   "runAnything.show": ["Ctrl Ctrl"],
   "view.quickSwitchScheme": ["Ctrl+`"],
   "vcs.changelist.move": ["Alt+Shift+M"],
+  "vcs.shelveSilently": ["Ctrl+Shift+H"],
+  "vcs.unshelveSilently": ["Ctrl+Alt+U"],
   "vcs.changelist.edit": ["F2", "Shift+F6"],
   "vcs.log.copyRevision": ["Ctrl+Alt+Shift+C"],
   "vcs.log.goToRef": ["Ctrl+F"],
+  "vcs.log.editMessage": ["F2", "Shift+F6"],
+  "vcs.log.newBranch": ["Ctrl+Alt+N"],
+  "vcs.log.goToChild": ["Left"],
+  "vcs.log.goToParent": ["Right"],
+  "vcs.log.toggleBookmark": ["F11"],
+  "vcs.log.toggleBookmarkWithMnemonic": ["Ctrl+F11"],
   // View › Appearance › Zoom IDE
   "view.zoomIn": ["Alt+Shift+="],
   "view.zoomOut": ["Alt+Shift+-"],
@@ -369,6 +378,7 @@ export const intellijWindows: Record<string, string[]> = {
   "db.openValueWindow": [],
   "db.findInValue": ["Ctrl+F"],
   "db.execute": ["Ctrl+Enter"],
+  "python.console.executeSelection": ["Alt+Shift+E"],
   "db.nextResultTab": ["Alt+Right"],
   "db.previousResultTab": ["Alt+Left"],
   // Table editor with pending changes (after `vcs.rollback`, so Ctrl+Alt+Z reverts the table's edits there).

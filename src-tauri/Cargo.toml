@@ -41,6 +41,7 @@ ide-core.workspace = true
 ide-cli.workspace = true
 dunce.workspace = true
 ide-clipboard.workspace = true
+ide-drag-out.workspace = true
 ide-fonts.workspace = true
 ide-text.workspace = true
 ide-vfs.workspace = true
@@ -67,6 +68,7 @@ ide-spell.workspace = true
 ide-ssh.workspace = true
 ide-remote.workspace = true
 ide-host.workspace = true
+ide-command.workspace = true
 ide-mcp.workspace = true
 ide-notebook.workspace = true
 ide-jsonrpc.workspace = true
@@ -87,15 +89,18 @@ block2 = "0.6"
 security-framework = "3.7"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "NSApplication", "NSButton", "NSEvent", "NSGraphics", "NSResponder", "NSScreen", "NSTitlebarAccessoryViewController", "NSToolbar", "NSView", "NSViewController", "NSWindow", "NSWindowTabGroup", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSNotification", "NSOperation", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSLocale", "NSNotification", "NSOperation", "NSString"] }
 # Used only by the debug font-restriction override; Cargo dependency cfg cannot test debug_assertions.
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKWebViewConfiguration", "WKPreferences"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Wayland detection and the client size without GTK's CSD shadow (linux_window_state.rs).
 gtk = "0.18"
+# WebKit settings of the web views (linux_webkit.rs).
+webkit2gtk = "2.0"
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_EnhancedStorage",
@@ -108,6 +113,7 @@ windows = { version = "0.62", features = [
 ] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_System_Diagnostics_Debug",
     "Win32_UI_Input_KeyboardAndMouse",

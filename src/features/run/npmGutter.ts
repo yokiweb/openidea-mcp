@@ -283,6 +283,7 @@ export async function scriptMenuItems(entry: ScriptEntry, path: string, content:
   return [
     {
       label: tx`Run '${label}'`,
+      preserveLabelEnd: true,
       icon: "run",
       shortcut: shortcutLabel("run.runContext"),
       run: () =>
@@ -292,6 +293,7 @@ export async function scriptMenuItems(entry: ScriptEntry, path: string, content:
     },
     {
       label: tx`Debug '${label}'`,
+      preserveLabelEnd: true,
       icon: "debug",
       shortcut: shortcutLabel("run.debugContext"),
       run: () => void executeAction("run.debugConfig", config),
@@ -312,6 +314,7 @@ class ScriptMarker extends GutterMarker {
     readonly entry: ScriptEntry,
     readonly path: string,
     readonly menu: EntryMenu,
+    readonly title: (entry: ScriptEntry) => string,
   ) {
     super();
   }
@@ -322,7 +325,7 @@ class ScriptMarker extends GutterMarker {
     const el = document.createElement("button");
     el.type = "button";
     el.className = styles.runMarker ?? "";
-    el.title = tx`Run '${this.entry.name}'`;
+    el.title = this.title(this.entry);
     el.setAttribute("aria-label", el.title);
     el.innerHTML = gutterIconMarkup("gutter-run") ?? "";
     el.addEventListener("click", () => {
@@ -350,6 +353,7 @@ export function entryGutter(
   file: RegExp,
   entries: (text: string) => ScriptEntry[],
   menu: EntryMenu,
+  title: (entry: ScriptEntry) => string = (entry) => tx`Run '${entry.name}'`,
 ): Extension {
   const path = ctx.path;
   if (ctx.virtual || !file.test(path) || !useProject.getState().project?.root) return [];
@@ -394,7 +398,7 @@ export function entryGutter(
       markers: (view) =>
         runIconsShown()
           ? RangeSet.of(
-              view.state.field(entriesField).map((e) => new ScriptMarker(e, path, menu).range(e.pos)),
+              view.state.field(entriesField).map((e) => new ScriptMarker(e, path, menu, title).range(e.pos)),
               true,
             )
           : RangeSet.empty,

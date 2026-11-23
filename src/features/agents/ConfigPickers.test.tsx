@@ -23,7 +23,29 @@ describe("configPickerOptions", () => {
   it("groups nested paths by their first provider and preserves the full value and description", () => {
     expect(configPickerOptions(config([value("9router/cmc/Beam", "Beam display", "Fast")]))).toEqual([
       { value: "9router", label: "9router", section: true },
-      { value: "9router/cmc/Beam", label: "Beam", detail: "cmc/Beam · Fast", keywords: "9router" },
+      { value: "9router/cmc/Beam", label: "Beam display", detail: "cmc/Beam · Fast", keywords: "9router" },
+    ]);
+  });
+  it("shows the agent-reported model name without the repeated provider prefix and keeps the id as the detail", () => {
+    expect(
+      configPickerOptions(
+        config([
+          { value: "opencode/beam-free", name: "opencode/Beam Free", description: null },
+          { value: "opencode/big-pickle", name: "opencode/Big Pickle", description: null },
+          { value: "opencode/hy4-flash-free", name: "opencode/hy4 flash Free", description: null },
+        ]),
+      ),
+    ).toEqual([
+      { value: "opencode", label: "opencode", section: true },
+      { value: "opencode/beam-free", label: "Beam Free", detail: "beam-free", keywords: "opencode" },
+      { value: "opencode/big-pickle", label: "Big Pickle", detail: "big-pickle", keywords: "opencode" },
+      { value: "opencode/hy4-flash-free", label: "hy4 flash Free", detail: "hy4-flash-free", keywords: "opencode" },
+    ]);
+  });
+  it("falls back to the compact id tail when the agent echoes the id as its name", () => {
+    expect(configPickerOptions(config([value("acme/ctx/big")]))).toEqual([
+      { value: "acme", label: "acme", section: true },
+      { value: "acme/ctx/big", label: "big", detail: "ctx/big", keywords: "acme" },
     ]);
   });
   it("keeps plain ids ungrouped even when the display name contains a slash", () => {
@@ -201,6 +223,25 @@ it("sends the complete nested model id through ConfigPickers", () => {
   expect(onChange).toHaveBeenCalledExactlyOnceWith("model", "9router/cmc/Beam");
 });
 
+it("lists ACP models by their reported names and sends the complete id", () => {
+  const onChange = vi.fn();
+  render(
+    <ConfigPickers
+      config={[
+        config([
+          { value: "opencode/beam-free", name: "opencode/Beam Free", description: null },
+          { value: "opencode/big-pickle", name: "opencode/Big Pickle", description: null },
+        ]),
+      ]}
+      onChange={onChange}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.getByRole("option", { name: /Beam Free/ })).toHaveTextContent("beam-free");
+  fireEvent.click(screen.getByRole("option", { name: /Beam Free/ }));
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("model", "opencode/beam-free");
+});
+
 it("edits secondary settings from the compact popup and restores focus when dismissed", () => {
   const approval: AgentConfigOption = {
     id: "approvals",
@@ -226,7 +267,7 @@ it("edits secondary settings from the compact popup and restores focus when dism
   expect(trigger).toHaveFocus();
 });
 
-describe("model and effort button", () => {
+describe("model settings", () => {
   const copilotConfig = (effortLevels: string[] | null = ["low", "medium", "high", "xhigh"]): AgentConfigOption[] => [
     {
       id: "model",
@@ -273,16 +314,66 @@ describe("model and effort button", () => {
     },
   ];
 
-  it("shows the effort as its own picker beside the model, and the mode with Allow All", () => {
+  it("keeps effort as a standalone setting when no model is available", () => {
+    render(
+      <ConfigPickers
+        config={[
+          {
+            id: "reasoning_effort",
+            name: "Reasoning Effort",
+            category: "thought_level",
+            description: null,
+            current: "medium",
+            via: "option",
+            values: [value("low"), value("medium")],
+          },
+        ]}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Reasoning Effort" })).toHaveTextContent("medium");
+    expect(screen.queryByRole("button", { name: "Agent settings" })).not.toBeInTheDocument();
+  });
+
+  it("keeps effort with model settings and the mode with Allow All", () => {
     const onChange = vi.fn();
     render(<ConfigPickers config={copilotConfig()} onChange={onChange} />);
-    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5.5");
+    const model = screen.getByRole("button", { name: "Model" });
+    expect(model).toHaveTextContent("Claude Sonnet 5.5");
+    const settings = screen.getByRole("button", { name: "Model settings: medium" });
     expect(screen.getByRole("button", { name: "Mode" })).toHaveTextContent("AgentAllow All");
-    const effort = screen.getByRole("button", { name: "Reasoning Effort" });
-    expect(effort).toHaveTextContent("medium");
-    fireEvent.click(effort);
-    fireEvent.click(screen.getByRole("option", { name: "XHigh" }));
+    fireEvent.click(settings);
+    const dialog = screen.getByRole("dialog", { name: "Model settings" });
+    const effort = within(dialog).getByRole("radiogroup", { name: "Effort Level" });
+    expect(within(effort).getByRole("radio", { name: "medium" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(effort).getByRole("radio", { name: "XHigh" }));
     expect(onChange).toHaveBeenCalledExactlyOnceWith("reasoning_effort", "xhigh");
+  });
+
+  it("lists more effort levels than fit the segmented control, one click away", () => {
+    const onChange = vi.fn();
+    const config = copilotConfig().map((o) =>
+      o.category === "thought_level"
+        ? {
+            ...o,
+            values: ["Low", "Medium", "High", "Extra high", "Max", "Ultra"].map((name) =>
+              value(name.toLowerCase().replace(" ", "-"), name),
+            ),
+            current: "max",
+          }
+        : o,
+    );
+    render(<ConfigPickers config={config} onChange={onChange} />);
+    fireEvent.click(screen.getByRole("button", { name: "Model settings: Max" }));
+    const dialog = screen.getByRole("dialog", { name: "Model settings" });
+    expect(within(dialog).queryByRole("radiogroup", { name: "Effort Level" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /Reasoning Effort/ })).not.toBeInTheDocument();
+    const levels = within(dialog).getByRole("listbox", { name: "Effort Level" });
+    expect(within(levels).getByRole("option", { name: /Max/ })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(within(levels).getByRole("option", { name: /Extra high/ }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("reasoning_effort", "extra-high");
+    // The only setting: choosing it is done.
+    expect(screen.queryByRole("dialog", { name: "Model settings" })).not.toBeInTheDocument();
   });
 
   it("tucks Fast into the model popup", () => {
@@ -300,12 +391,12 @@ describe("model and effort button", () => {
     ];
     render(<ConfigPickers config={config} onChange={vi.fn()} />);
     expect(screen.queryByRole("switch", { name: "Fast" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Model" }));
-    const dialog = screen.getByRole("dialog", { name: "Model" });
+    fireEvent.click(screen.getByRole("button", { name: "Model settings: Fast: Off" }));
+    const dialog = screen.getByRole("dialog", { name: "Model settings" });
     expect(within(dialog).getByRole("switch", { name: "Fast" })).toHaveAttribute("aria-checked", "false");
   });
 
-  it("lists models by name in one page, with context size, cost and pinning", () => {
+  it("keeps the model list to models and the settings chip to every model setting", () => {
     const onChange = vi.fn();
     const cfg = copilotConfig().map((o) =>
       o.id === "model"
@@ -328,26 +419,37 @@ describe("model and effort button", () => {
       values: [value("default", "200K"), value("long_context", "1M")],
     });
     render(<ConfigPickers config={cfg} onChange={onChange} />);
-    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5.51M");
+    const model = screen.getByRole("button", { name: "Model" });
+    expect(model).toHaveTextContent("Claude Sonnet 5.5");
+    const settings = screen.getByRole("button", { name: /^Model settings:/ });
+    expect(settings).toHaveTextContent("medium · 1M");
 
-    fireEvent.click(screen.getByRole("button", { name: "Model" }));
-    const dialog = screen.getByRole("dialog", { name: "Model" });
-    expect(within(dialog).queryByText("Balanced")).not.toBeInTheDocument();
-    expect(within(dialog).getByText("Medium cost")).toBeVisible();
+    fireEvent.click(model);
+    const models = screen.getByRole("dialog", { name: "Model" });
+    expect(within(models).queryByText("Balanced")).not.toBeInTheDocument();
+    expect(within(models).getByText("Medium cost")).toBeVisible();
+    expect(within(models).queryByRole("radio")).not.toBeInTheDocument();
+    expect(within(models).queryByRole("button", { name: /^Configure/ })).not.toBeInTheDocument();
+    fireEvent.click(within(models).getAllByRole("button", { name: "Pin model" })[0]!);
+    const listbox = within(models).getByRole("listbox", { name: "Model" });
+    expect(within(listbox).getByText("Pinned")).toBeVisible();
+    expect(within(listbox).getByText("Models")).toBeVisible();
+    fireEvent.click(within(models).getByRole("option", { name: /GPT-6 Sol/ }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("model", "gpt-6-sol");
+    expect(screen.queryByRole("dialog", { name: "Model" })).not.toBeInTheDocument();
 
+    onChange.mockClear();
+    fireEvent.click(settings);
+    const dialog = screen.getByRole("dialog", { name: "Model settings" });
+    expect(within(dialog).queryByRole("button", { name: "Back to models" })).not.toBeInTheDocument();
+    const effortGroup = within(dialog).getByRole("radiogroup", { name: "Effort Level" });
+    expect(within(effortGroup).getByRole("radio", { name: "medium" })).toHaveAttribute("aria-checked", "true");
     const contextGroup = within(dialog).getByRole("radiogroup", { name: "Context Size" });
     expect(within(contextGroup).getByRole("radio", { name: "1M" })).toHaveAttribute("aria-checked", "true");
     fireEvent.click(within(contextGroup).getByRole("radio", { name: "200K" }));
-    expect(onChange).toHaveBeenCalledWith("contextTier", "default");
-
-    fireEvent.click(within(dialog).getAllByRole("button", { name: "Pin model" })[0]!);
-    const listbox = within(dialog).getByRole("listbox", { name: "Model" });
-    expect(within(listbox).getByText("Pinned")).toBeVisible();
-    expect(within(listbox).getByText("Models")).toBeVisible();
-
-    fireEvent.click(within(dialog).getByRole("option", { name: /GPT-6 Sol/ }));
-    expect(onChange).toHaveBeenCalledWith("model", "gpt-6-sol");
-    expect(screen.queryByRole("dialog", { name: "Model" })).not.toBeInTheDocument();
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("contextTier", "default");
+    // Several settings: the popup stays for the next one.
+    expect(screen.getByRole("dialog", { name: "Model settings" })).toBeInTheDocument();
   });
 
   it("filters the model list and picks the highlighted model with the keyboard", () => {

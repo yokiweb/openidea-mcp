@@ -6,12 +6,12 @@
  * The Markdown parser (marked + DOMPurify, ~40 KB gzip) loads on first use and
  * is prefetched when the app goes idle; until then markup shows as plain text.
  */
+import { openCodeLocation } from "@/editor/api";
 import { useMemo, useSyncExternalStore } from "react";
 import { LanguageDescription, type Language } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { classHighlighter, highlightTree } from "@lezer/highlight";
 import type { Markup } from "@/bindings";
-import { maybeEditorService } from "@/workbench/contributions";
 import { isTauri } from "@/platform/ipc";
 import { onOtherShare } from "@/platform/paths";
 import { useProject } from "@/platform/project";
@@ -192,8 +192,26 @@ function highlightBlocks(root: HTMLElement, fallback: string | null) {
     const lang = cls ? cls.slice("language-".length) : fallback;
     const text = (code.textContent ?? "").replace(/\n+$/, "");
     code.textContent = text;
-    void highlightInto(code, text, lang);
+    void highlightInto(code, text, lang).then(() => wrapPlainNames(code));
   });
+}
+
+/**
+ * Puts the names a grammar left as plain text in spans (`.tok-name`), as the ones it
+ * recognised are, so a signature's names can be followed (`linkSignatureTypes` in docs.ts):
+ * signatures aren't always code a grammar parses (`(method) Cart.add(product: Product)`).
+ */
+function wrapPlainNames(code: HTMLElement) {
+  for (const node of [...code.childNodes]) {
+    if (node.nodeType !== Node.TEXT_NODE) continue;
+    const parts = (node.textContent ?? "").split(/([\p{L}_$][\p{L}\p{N}_$]*)/u);
+    if (parts.length < 2) continue;
+    node.replaceWith(
+      ...parts.map((p, i) =>
+        i % 2 ? Object.assign(document.createElement("span"), { className: "tok-name", textContent: p }) : p,
+      ),
+    );
+  }
 }
 
 /** A documentation link to a source position (`file://…#L12,5`, `jdt://…#L42`); null for web links. */
@@ -208,7 +226,8 @@ export function sourceLink(href: string): { path: string; line: number; col: num
     const path = decodeURIComponent(url.pathname);
     // Documentation is text someone else wrote.
     if (onOtherShare(path, useProject.getState().project?.root ?? "")) return null;
-    const m = /^#?L?(\d+)(?:[,:](\d+))?/.exec(url.hash.slice(1));
+    // typescript-language-server encodes the comma (`#L20%2C3`).
+    const m = /^#?L?(\d+)(?:[,:](\d+))?/.exec(url.hash.slice(1).replace(/%2C/gi, ","));
     return {
       path,
       line: m ? Math.max(0, Number(m[1]) - 1) : 0,
@@ -228,10 +247,7 @@ export function sourceLink(href: string): { path: string; line: number; col: num
 export function openDocLink(href: string) {
   const target = sourceLink(href);
   if (target) {
-    void maybeEditorService()?.openFile(target.path, {
-      selection: { line: target.line, col: target.col },
-      focus: true,
-    });
+    void openCodeLocation(target.path, { line: target.line, col: target.col });
   } else if (/^https?:\/\//.test(href) && isTauri()) {
     void import("@tauri-apps/plugin-opener").then((m) => m.openUrl(href)).catch(() => {});
   }

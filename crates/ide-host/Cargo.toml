@@ -11,6 +11,7 @@ path = "src/bin/server.rs"
 
 [dependencies]
 encoding_rs.workspace = true
+ide-command.workspace = true
 ide-core.workspace = true
 ide-mcp.workspace = true
 futures.workspace = true
@@ -57,6 +58,7 @@ ide-plugin.workspace = true
 ide-tools = { path = "../ide-tools" }
 ide-scaffold.workspace = true
 ide-docker = { path = "../ide-docker" }
+ide-flutter = { path = "../ide-flutter" }
 semver = "1"
 serde.workspace = true
 jsonschema = { version = "0.33", default-features = false }

@@ -20,6 +20,7 @@ const backend = vi.hoisted(() => ({
   notify: vi.fn(),
   changes: vi.fn(),
   setMessage: vi.fn(),
+  revision: vi.fn(),
 }));
 
 vi.mock("@/platform/ipc", async (original) => ({
@@ -35,7 +36,12 @@ vi.mock("@/platform/ipc", async (original) => ({
 vi.mock("@/workbench/contributions", async (original) => ({
   ...(await original<typeof import("@/workbench/contributions")>()),
   notifications: () => ({ notify: backend.notify }),
-  maybeCommitService: () => ({ changes: backend.changes, setMessage: backend.setMessage, selection: vi.fn() }),
+  maybeCommitService: () => ({
+    changes: backend.changes,
+    setMessage: backend.setMessage,
+    revision: backend.revision,
+    selection: vi.fn(),
+  }),
 }));
 
 const ok = (data: unknown) => Promise.resolve({ status: "ok" as const, data });
@@ -105,6 +111,15 @@ describe("commitMessagePrompt", () => {
 
   it("leaves out the style hint without earlier commits", () => {
     expect(commitMessagePrompt(PATCH, 72, [])).not.toContain("latest commits");
+  });
+
+  it("adds the project's commit conventions before the recent subjects", () => {
+    const prompt = commitMessagePrompt(PATCH, 72, ["fix: y"], "  Use Conventional Commits.\nPrefix the issue key.  ");
+    const conventions = prompt.indexOf("Follow these conventions for commit messages here:\nUse Conventional Commits.");
+    expect(conventions).toBeGreaterThan(0);
+    expect(prompt).toContain("Prefix the issue key.\n");
+    expect(conventions).toBeLessThan(prompt.indexOf("latest commits"));
+    expect(commitMessagePrompt(PATCH, 72, [], " \n ")).not.toContain("conventions");
   });
 });
 
@@ -183,6 +198,11 @@ describe("askingChoices", () => {
     expect(askingChoices([codex])).toEqual([{ id: "mode", value: "read-only" }]);
   });
 
+  it("prefers read-only over a mode that asks before it writes", () => {
+    const codex = option("mode", "mode", ["read-only", "ask", "auto", "full-access"], "auto");
+    expect(askingChoices([codex])).toEqual([{ id: "mode", value: "read-only" }]);
+  });
+
   it("turns allow-all permissions and bypassed approvals off", () => {
     const options = [
       option("permissions", "perm", ["on", "off"], "on"),
@@ -254,6 +274,73 @@ describe("pickAgent", () => {
   });
 });
 
+describe("pickAgent with an agent chosen for commit messages", () => {
+  const effort: AgentConfigOption = {
+    id: "effort",
+    name: "Effort",
+    description: null,
+    category: "thought_level",
+    current: "high",
+    values: ["low", "high"].map((value) => ({ value, name: value, description: null })),
+    via: "option",
+  };
+  const claude = { ...provider("claude", true, [modelOption("smart")]), thoughtLevels: { fast: [effort] } };
+  const tasks = [
+    task("a", "claude", { updatedMs: 1, config: [modelOption("smart")] }),
+    task("b", "codex", { updatedMs: 5 }),
+  ];
+  const prefer = (agent: string, model = "", level = "") => ({ agent, agentModel: model, agentEffort: level });
+
+  it("uses that agent over the latest task's, on the model of its own latest task", () => {
+    expect(pickAgent(tasks, [claude, provider("codex")], draft("codex"), prefer("claude"))).toEqual({
+      provider: "claude",
+      config: [{ id: "model", value: "smart" }],
+    });
+  });
+
+  it("runs the chosen model at the chosen effort", () => {
+    expect(pickAgent(tasks, [claude, provider("codex")], draft("codex"), prefer("claude", "fast", "low"))).toEqual({
+      provider: "claude",
+      config: [
+        { id: "model", value: "fast" },
+        { id: "effort", value: "low" },
+      ],
+    });
+  });
+
+  it("reads the models from the agent's refreshed catalog", () => {
+    const catalog = {
+      config: [{ ...modelOption("smart"), values: [{ value: "mini", name: "mini", description: null }] }],
+      thoughtLevels: { mini: [effort] },
+    };
+    expect(
+      pickAgent([], [claude], draft("claude"), prefer("claude", "mini", "low"), new Map([["claude", catalog]])),
+    ).toEqual({
+      provider: "claude",
+      config: [
+        { id: "model", value: "mini" },
+        { id: "effort", value: "low" },
+      ],
+    });
+  });
+
+  it("keeps the agent's model and effort for values it doesn't offer", () => {
+    expect(pickAgent([], [claude], draft("claude"), prefer("claude", "gone", "low"))).toEqual({
+      provider: "claude",
+      config: [{ id: "model", value: "smart" }],
+    });
+  });
+
+  it("follows the latest task when the chosen agent isn't installed", () => {
+    expect(
+      pickAgent(tasks, [provider("claude", false), provider("codex")], draft("codex"), prefer("claude", "fast")),
+    ).toEqual({
+      provider: "codex",
+      config: [],
+    });
+  });
+});
+
 describe("generateCommitMessage", () => {
   const changes = { revision: 3, roots: ["/p"], patch: PATCH };
   const notified = () => backend.notify.mock.calls.map(([n]) => n as { level: string; title: string; body?: string });
@@ -278,6 +365,7 @@ describe("generateCommitMessage", () => {
     vi.clearAllMocks();
     backend.changes.mockResolvedValue(changes);
     backend.setMessage.mockReturnValue(true);
+    backend.revision.mockReturnValue(changes.revision);
     backend.log.mockImplementation(() => ok([{ summary: "feat: earlier" }]));
     backend.cancel.mockImplementation(() => ok(null));
     backend.remove.mockImplementation(() => ok(null));
@@ -375,6 +463,14 @@ describe("generateCommitMessage", () => {
     await generateCommitMessage();
     expect(notified()).toEqual([expect.objectContaining({ level: "info", title: "Commit message not replaced" })]);
     expect(backend.remove).toHaveBeenCalledWith("new", false);
+  });
+
+  it("does not fill in a message for changes edited in the files while the agent worked", async () => {
+    createdTask("ready");
+    backend.changes.mockResolvedValueOnce(changes).mockResolvedValue({ ...changes, patch: changes.patch + "+more\n" });
+    await generateCommitMessage();
+    expect(backend.setMessage).not.toHaveBeenCalled();
+    expect(notified()).toEqual([expect.objectContaining({ level: "info", title: "Commit message not replaced" })]);
   });
 
   it("runs once at a time", async () => {

@@ -42,6 +42,14 @@
   margin-inline: 0;
   border-radius: 0;
 }
+.tree [data-tree-toggle] {
+  margin-inline-start: var(--space-2);
+  width: var(--space-3);
+}
+.tree [data-tree-toggle] svg {
+  width: var(--space-3);
+  height: var(--space-3);
+}
 .tree [role="treeitem"][aria-selected="true"] {
   background: var(--bg-tree-selected);
 }
@@ -78,12 +86,21 @@
   min-height: 40px;
   padding: 0 12px 0 20px;
 }
+/* Controls a page puts beside its title (e.g. Plugins' tabs), centred in the header. */
+.headerSlot {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
 .history {
   display: inline-flex;
   gap: var(--space-0-5);
 }
 .crumbs {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -92,19 +109,28 @@
   color: var(--fg-strong);
   font-weight: 600;
 }
-.crumb:last-child {
+.parentCrumbs {
+  display: flex;
   min-width: 0;
-}
-.crumb > span {
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 .crumb {
   display: inline-flex;
   align-items: center;
+  min-width: 0;
+}
+.crumbLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.currentCrumb {
+  flex: none;
+  max-width: 100%;
 }
 .crumbSep {
-  margin: 0 4px;
+  flex: none;
+  margin-inline: var(--space-1);
   color: var(--fg-subtle);
 }
 .reset {
@@ -160,6 +186,10 @@
   padding: 4px 20px 20px;
   -webkit-user-select: text;
   user-select: text;
+}
+.pageBodyBleed {
+  padding: 0;
+  overflow: hidden;
 }
 
 .groupPage {

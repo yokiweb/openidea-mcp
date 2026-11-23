@@ -1,7 +1,6 @@
 use crate::editorconfig::{EditorConfig, EditorConfigProps};
 use crate::file_defaults::FileDefaults;
 use ide_core::error::ErrorKind;
-use ide_core::event::NotifyLevel;
 use ide_core::{ChangeSet, DocId, IdeError, IdeEvent, IdeResult, LanguageId, SharedSink, TextEdit};
 use ide_text::{AppliedChange, ByteEdit, Document, LineEnding};
 use parking_lot::{Mutex, ReentrantMutex, RwLock};
@@ -172,6 +171,9 @@ struct DocState {
     /// Disk state we last loaded or wrote; changes matching it are our own.
     disk_mtime: f64,
     disk_len: u64,
+    /// The file changed on disk while this buffer had unsaved changes; autosave leaves it
+    /// alone until the user saves explicitly or the buffer is reloaded.
+    disk_conflict: bool,
     closed: bool,
     /// URI of a virtual document (no file behind it).
     uri: Option<String>,
@@ -264,6 +266,7 @@ impl Documents {
                 st.native_to_ascii = enabled;
                 st.disk_mtime = loaded.mtime_ms;
                 st.disk_len = disk_len(&st.path);
+                st.disk_conflict = false;
                 Ok(())
             });
             if let Err(e) = result {
@@ -457,6 +460,7 @@ impl Documents {
             encoding_chosen: false,
             disk_mtime: loaded.mtime_ms,
             disk_len: disk_len(path),
+            disk_conflict: false,
             closed: false,
             uri: None,
         };
@@ -529,6 +533,7 @@ impl Documents {
             encoding_chosen: false,
             disk_mtime: 0.0,
             disk_len: 0,
+            disk_conflict: false,
             closed: false,
             uri: Some(uri.to_owned()),
         };
@@ -587,6 +592,7 @@ impl Documents {
             encoding_chosen: false,
             disk_mtime: 0.0,
             disk_len: 0,
+            disk_conflict: false,
             closed: false,
             uri: Some(key.to_string_lossy().into_owned()),
         };
@@ -653,6 +659,8 @@ impl Documents {
         };
         let mut st = slot.lock();
         st.closed = true;
+        // A buffer closed with changes (Don't Save) has nothing left to save.
+        self.set_dirty(doc, &mut st, false);
         if st.observed {
             for o in self.observers() {
                 o.closed(doc, &st.path);
@@ -663,7 +671,7 @@ impl Documents {
     fn set_dirty(&self, doc: DocId, st: &mut DocState, dirty: bool) {
         if st.dirty != dirty {
             st.dirty = dirty;
-            self.sink.emit(IdeEvent::DocDirty { doc, dirty });
+            self.sink.emit(IdeEvent::DocDirty { doc, dirty, version: st.doc.version() });
         }
     }
 
@@ -810,7 +818,22 @@ impl Documents {
     /// Writes the document with its original encoding, BOM and line ending.
     /// A clean document is not rewritten.
     pub fn save(&self, doc: DocId) -> IdeResult<()> {
+        self.with_doc(doc, |st| self.write(doc, st))
+    }
+
+    /// An automatic save (switching tabs, the window losing focus): `false` when the file changed
+    /// on disk after this buffer was edited, which only an explicit save may overwrite.
+    pub fn autosave(&self, doc: DocId) -> IdeResult<bool> {
         self.with_doc(doc, |st| {
+            if st.dirty && st.disk_conflict {
+                return Ok(false);
+            }
+            self.write(doc, st).map(|()| true)
+        })
+    }
+
+    fn write(&self, doc: DocId, st: &mut DocState) -> IdeResult<()> {
+        {
             if !st.dirty || st.uri.is_some() {
                 return Ok(());
             }
@@ -822,6 +845,7 @@ impl Documents {
             };
             st.disk_mtime = mtime;
             st.disk_len = disk_len(&st.path);
+            st.disk_conflict = false;
             self.set_dirty(doc, st, false);
             if st.observed {
                 let text = st.doc.text();
@@ -830,7 +854,7 @@ impl Documents {
                 }
             }
             Ok(())
-        })
+        }
     }
 
     /// Save As for an untitled buffer: writes it to `target` (creating missing
@@ -1090,6 +1114,7 @@ impl Documents {
                 st.has_bom = loaded.has_bom;
                 st.disk_mtime = loaded.mtime_ms;
                 st.disk_len = disk_len(&st.path);
+                st.disk_conflict = false;
                 self.replace_locked(doc, st, &loaded.text)?;
                 // Reloading is not an edit: the buffer matches the file again.
                 self.set_dirty(doc, st, false);
@@ -1109,6 +1134,24 @@ impl Documents {
             st.has_bom = has_bom;
             self.set_dirty(doc, st, true);
             Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom })
+        })
+    }
+
+    /// Load Changes from Disk: drops the buffer's unsaved changes and reads its file again in
+    /// the buffer's encoding, after the file changed on disk (`IdeEvent::DocDiskConflict`).
+    pub fn discard_and_reload(&self, doc: DocId) -> IdeResult<()> {
+        self.with_doc(doc, |st| {
+            if st.uri.is_some() || st.binary {
+                return Err(IdeError::invalid("only a file's text can be reloaded from disk"));
+            }
+            let loaded = Self::load_as(&st.path, &st.encoding, st.native_to_ascii)?;
+            st.has_bom = loaded.has_bom;
+            st.disk_mtime = loaded.mtime_ms;
+            st.disk_len = disk_len(&st.path);
+            st.disk_conflict = false;
+            self.replace_locked(doc, st, &loaded.text)?;
+            self.set_dirty(doc, st, false);
+            Ok(())
         })
     }
 
@@ -1224,7 +1267,7 @@ impl Documents {
     }
 
     /// Re-reads from disk after an external change. Clean documents reload
-    /// silently; dirty ones are left alone and reported via `IdeEvent::Notify`.
+    /// silently; dirty ones are left alone and reported via `IdeEvent::DocDiskConflict`.
     /// Changes matching our own last save are ignored.
     pub fn on_disk_changed(&self, paths: &[PathBuf]) {
         self.reload_from_disk(paths, false, false);
@@ -1262,16 +1305,8 @@ impl Documents {
                 if st.dirty {
                     st.disk_mtime = mtime;
                     st.disk_len = meta.len();
-                    let name = st.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    self.sink.emit(IdeEvent::Notify {
-                        level: NotifyLevel::Warning,
-                        title: format!("{name} changed on disk"),
-                        body: Some(format!(
-                            "{} was modified externally but has unsaved changes in the editor. \
-                             Saving will overwrite the external changes.",
-                            st.path.display()
-                        )),
-                    });
+                    st.disk_conflict = true;
+                    self.sink.emit(IdeEvent::DocDiskConflict { doc: id, path: st.path.to_string_lossy().into_owned() });
                     return Ok(());
                 }
                 let loaded = if force_clean {
@@ -1289,6 +1324,7 @@ impl Documents {
                 };
                 st.disk_mtime = loaded.mtime_ms;
                 st.disk_len = disk_len(&st.path);
+                st.disk_conflict = false;
                 if loaded.binary || st.binary {
                     return Ok(());
                 }

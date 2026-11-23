@@ -10,19 +10,20 @@ import { maybeEditorService, registerOverlay, registerStatusItem, registerToolWi
 import { confirmLeaveProject } from "@/platform/project";
 import { ConnectHost } from "./ConnectDialog";
 import { reopenInContainer } from "./container";
-import { reloadEnvironment } from "./environment";
+import { installDirenvNotifications, reloadEnvironment } from "./environment";
 import { RemoteStatus } from "./RemoteStatus";
 import { closeConnectDialog, openConnectDialog } from "./model";
 import { restorePorts, usePorts } from "./ports";
 import { installReconnect, reconnectNow } from "./reconnect";
 
-/** Forwarded ports are available while this window is connected to an SSH host or a dev container. */
+/** Forwarded ports are available while this window is connected to an SSH host, a WSL distribution or a dev container. */
 function trackPortsWindow(): () => void {
   let off: (() => void) | null = null;
   let session = useRemote.getState().session;
   const sync = () => {
     const next = useRemote.getState().session;
-    const connected = next?.target.kind === "ssh" || next?.target.kind === "devContainer";
+    const connected =
+      next?.target.kind === "ssh" || next?.target.kind === "wsl" || next?.target.kind === "devContainer";
     if (connected && (next !== session || !off)) {
       usePorts.setState({ ports: [] });
       void restorePorts();
@@ -56,6 +57,7 @@ export function activate(): () => void {
   const disposers = [
     trackPortsWindow(),
     installReconnect(),
+    installDirenvNotifications(),
     registerOverlay({ id: "remote.connect", component: ConnectHost }),
     registerStatusItem({
       id: "remote.location",
@@ -70,7 +72,7 @@ export function activate(): () => void {
         title: "Remote Development…",
         description: "Opens a project folder on an SSH host; the IDE backend runs on that host.",
         category: "File",
-        icon: "folder",
+        icon: "remote",
         keywords: ["ssh", "remote", "server", "gateway", "connect", "host"],
         run: () => openConnectDialog(),
       },
@@ -116,7 +118,20 @@ export function activate(): () => void {
         description:
           "Reads the login shell's environment (and devcontainer.json remoteEnv on a remote host) again for new terminals and processes.",
         category: "File",
-        keywords: ["env", "environment", "variables", "path", "shell", "remoteEnv", "devcontainer", "reload"],
+        keywords: [
+          "env",
+          "environment",
+          "variables",
+          "path",
+          "shell",
+          "remoteEnv",
+          "devcontainer",
+          "direnv",
+          "envrc",
+          "nix",
+          "flake",
+          "reload",
+        ],
         when: "projectOpen",
         run: () => reloadEnvironment(),
       },

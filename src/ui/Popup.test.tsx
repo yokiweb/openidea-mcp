@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { getContext, setContext } from "@/platform/context";
 import { registerAction } from "@/platform/actions";
+import { usePlatform } from "@/platform/platformInfo";
 import { Popup } from "./Popup";
 import { ContextMenuHost, Menu, MenuList, hideContextMenu, showContextMenu, useContextMenuStore } from "./Menu";
 import menuStyles from "./Menu.module.css";
@@ -114,6 +115,7 @@ describe("Popup", () => {
     );
     const popup = screen.getByRole("dialog", { name: "Branches" });
     expect([popup.style.width, popup.style.height]).toEqual(["400px", "300px"]);
+    expect(popup.hasAttribute("data-resized")).toBe(true);
     // jsdom lays nothing out: the popup measures what its style says, at the origin.
     popup.getBoundingClientRect = () =>
       new DOMRect(0, 0, parseFloat(popup.style.width), parseFloat(popup.style.height));
@@ -136,6 +138,7 @@ describe("Popup", () => {
       </Popup>,
     );
     expect(screen.getByRole("dialog", { name: "Menu" }).style.width).toBe("");
+    expect(screen.getByRole("dialog", { name: "Menu" }).hasAttribute("data-resized")).toBe(false);
     expect(screen.queryByRole("separator", { name: "Resize" })).toBeNull();
   });
 });
@@ -260,6 +263,32 @@ describe("Menu action enablement", () => {
     } finally {
       document.removeEventListener("focusin", drop);
       document.getSelection()!.removeAllRanges();
+    }
+  });
+
+  it("runs an item's modifier action on ⌘-click (macOS) or Ctrl-click, and shows its hint", () => {
+    const os = usePlatform.getState().os;
+    try {
+      for (const [platform, mod] of [
+        ["macos", { metaKey: true }],
+        ["linux", { ctrlKey: true }],
+      ] as const) {
+        usePlatform.setState({ os: platform });
+        const run = vi.fn();
+        const only = vi.fn();
+        const items = [{ label: "frontend", run, runWithModifier: only, hint: "Only frontend" }];
+        const { unmount } = render(<MenuList items={items} onDone={() => {}} />);
+        const row = screen.getByRole("menuitem", { name: /frontend/ });
+        expect(row).toHaveAttribute("title", "Only frontend");
+        fireEvent.click(row);
+        expect(run).toHaveBeenCalledTimes(1);
+        fireEvent.click(row, mod);
+        expect(only).toHaveBeenCalledTimes(1);
+        expect(run).toHaveBeenCalledTimes(1);
+        unmount();
+      }
+    } finally {
+      usePlatform.setState({ os });
     }
   });
 
