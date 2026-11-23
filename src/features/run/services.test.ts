@@ -770,11 +770,11 @@ describe("backend-owned runs (in-app MCP server)", () => {
   });
 
   it("shows a running service even though the frontend has no session", () => {
-    const [group] = runServiceItems([c], [], DEFAULT_TYPES, [], {}, [], () => false, {}, [external]);
+    const [group] = runServiceItems([c], [], ["spring-boot"], {}, [], () => false, {}, [external]);
     expect(group?.detail).toBe("1 running");
     expect(group?.children?.[0]).toMatchObject({ icon: "run", detail: "MCP · PID 12345", dim: false });
     // Without the mirror the same configuration stays dark and idle.
-    expect(runServiceItems([c], [], DEFAULT_TYPES)[0]?.children?.[0]).toMatchObject({ dim: true });
+    expect(runServiceItems([c], [], ["spring-boot"])[0]?.children?.[0]).toMatchObject({ dim: true });
   });
 
   it("adopts only live backend runs the frontend does not own", async () => {

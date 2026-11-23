@@ -11,7 +11,7 @@ fn err(e: ide_core::IdeError) -> String {
 }
 
 fn find_source(host: &Host, window: &str, name: &str) -> Result<ide_db::DataSource, String> {
-    let sources = crate::ops::db::sources(host, window).map_err(err)?;
+    let sources = crate::ops::db::db_sources(host, window).map_err(err)?;
     if let Some(source) = sources.iter().find(|s| s.id == name) {
         return Ok(source.clone());
     }
@@ -27,7 +27,7 @@ fn find_source(host: &Host, window: &str, name: &str) -> Result<ide_db::DataSour
 }
 
 pub async fn list_datasources(host: &Host, window: &str) -> Result<serde_json::Value, String> {
-    let sources = crate::ops::db::sources(host, window).map_err(err)?;
+    let sources = crate::ops::db::db_sources(host, window).map_err(err)?;
     let connected = host.project(window).map(|p| p.db.connected()).unwrap_or_default();
     let data_sources = sources
         .iter()
@@ -65,9 +65,10 @@ pub async fn execute_query(
     check(&statements)?;
     let max_rows = max_rows.unwrap_or(200).clamp(1, 1000);
     // 上游 execute 新增 schema 上下文；MCP 没有 console 的活动 schema，传 None 表示不切换。
-    let outcomes = crate::ops::db::execute(host, window, RequestId::next(), &source.id, statements, 0, max_rows, None)
-        .await
-        .map_err(err)?;
+    let outcomes =
+        crate::ops::db::db_execute(host, window, RequestId::next(), source.id.clone(), statements, 0, max_rows, None)
+            .await
+            .map_err(err)?;
     let mut results = Vec::new();
     for outcome in outcomes {
         if let Some(error) = outcome.error {

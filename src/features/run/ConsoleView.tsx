@@ -18,7 +18,6 @@ import { useWorkflowSettings } from "@/platform/workflowSettings";
 import { useConsoleFont } from "@/platform/consoleFont";
 import { Icon, showContextMenu } from "@/ui";
 import { spanStyle, type Span, type SpanStyle } from "@/ui/ansi";
-import ansi from "@/ui/ansi.module.css";
 import { logLineColor } from "@/ui/logColors";
 import { compileConsoleRules, matchConsoleRules, styleSpans, type ConsoleRuleMatch } from "@/ui/consoleRules";
 import { useConsoleRules } from "@/workbench/contributions";
