@@ -5,31 +5,17 @@
 //! 这六个工具从自研 `ide-mcp` crate 迁来（2026-11-10 合并上游），
 //! 挂在同一个 `ToolRegistry` 上，与上游 21 个工具并存。
 //!
-//! 与自研版的差异：不再需要 `RunRecord`（同进程，`host.processes` 已是全量），
-//! `execute_query` 的写权限改由设置页的 `allowWrite` 决定（见 [`set_allow_write`]）。
+//! 与自研版的差异：不再需要 `RunRecord`（同进程，`host.processes` 已是全量）。
+//! `execute_query` 恒为只读白名单（上游对齐，无写权限开关）。
 
 mod db;
 
 use super::tool::{Output, Param, ParamType, Tool};
 use crate::Host;
-use crate::ops::Emit;
+use crate::ops::Channel;
 use ide_core::{IdeError, RunId};
 use ide_run::{OutputChunk, RunConfig, RunInfo};
 use serde_json::json;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// 设置页的「允许写操作」开关（`mcp.json` 的 `allowWrite`）。
-/// 只作用于 [`db::execute_query`]：上游没有 DB 工具，这是唯一的写入口。
-static ALLOW_WRITE: AtomicBool = AtomicBool::new(false);
-
-pub fn set_allow_write(allow: bool) {
-    ALLOW_WRITE.store(allow, Ordering::Relaxed);
-}
-
-pub fn allow_write() -> bool {
-    ALLOW_WRITE.load(Ordering::Relaxed)
-}
 
 pub fn tools() -> Vec<Tool> {
     vec![
@@ -66,8 +52,8 @@ fn runs_of(host: &Host, config_id: &str) -> Vec<RunInfo> {
     host.processes.list().into_iter().filter(|r| r.config_id == config_id).collect()
 }
 
-fn no_op_output() -> Emit<OutputChunk> {
-    Arc::new(|_| {})
+fn no_op_output() -> Channel<OutputChunk> {
+    Channel::new(|_| {})
 }
 
 /// JVM application kinds (`application` / `spring-boot`): their command line keeps the
@@ -165,7 +151,7 @@ pub async fn start_service(host: &Host, window: &str, name: &str) -> Result<serd
     }
     let config =
         if is_jvm_application(&config.kind) { resolve_java_command(host, window, &config).await? } else { config };
-    let info = crate::ops::run::start(host, window, config.clone(), no_op_output()).await.map_err(err)?;
+    let info = crate::ops::run::run_start(host, window, config.clone(), no_op_output(), None).await.map_err(err)?;
     Ok(json!({
         "started": true,
         "runId": info.id.0,
@@ -177,7 +163,7 @@ pub async fn start_service(host: &Host, window: &str, name: &str) -> Result<serd
 
 pub async fn stop_service(host: &Host, window: &str, name: &str) -> Result<serde_json::Value, String> {
     let id = resolve_run(host, window, name)?;
-    crate::ops::run::stop(host, window, id).map_err(err)?;
+    crate::ops::run::run_stop(host, window, id).map_err(err)?;
     Ok(json!({ "stopped": true, "runId": id.0 }))
 }
 

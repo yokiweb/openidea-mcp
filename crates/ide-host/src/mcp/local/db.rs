@@ -1,7 +1,6 @@
 //! 数据库工具：项目的数据源与只读查询（上游 21 个工具里没有任何 DB 能力）。
 
 use super::super::tool::{Output, Param, ParamType, Tool};
-use super::allow_write;
 use crate::Host;
 use ide_core::{IdeError, RequestId};
 use ide_db::split::SqlStatement;
@@ -63,7 +62,7 @@ pub async fn execute_query(
     if statements.is_empty() {
         return Err("the input contains no SQL statement".into());
     }
-    check(&statements, allow_write())?;
+    check(&statements)?;
     let max_rows = max_rows.unwrap_or(200).clamp(1, 1000);
     // 上游 execute 新增 schema 上下文；MCP 没有 console 的活动 schema，传 None 表示不切换。
     let outcomes = crate::ops::db::execute(host, window, RequestId::next(), &source.id, statements, 0, max_rows, None)
@@ -99,13 +98,9 @@ pub async fn execute_query(
 /// read-only) pragmas of SQLite / Postgres / MySQL.
 const READ_ONLY: [&str; 7] = ["select", "with", "explain", "show", "describe", "desc", "pragma"];
 
-/// Rejects statements that are not read-only unless the settings page turned on
-/// `allowWrite`. The check is a coarse first line: the driver and the data
-/// source's `read_only` flag remain the real enforcement.
-fn check(statements: &[SqlStatement], allow_write: bool) -> Result<(), String> {
-    if allow_write {
-        return Ok(());
-    }
+/// Rejects statements that are not read-only. The check is a coarse first line:
+/// the driver and the data source's `read_only` flag remain the real enforcement.
+fn check(statements: &[SqlStatement]) -> Result<(), String> {
     for statement in statements {
         let keyword = leading_keyword(&statement.text);
         if !READ_ONLY.contains(&keyword.as_str()) {
@@ -113,8 +108,7 @@ fn check(statements: &[SqlStatement], allow_write: bool) -> Result<(), String> {
             let sample: String = sample.chars().take(120).collect();
             return Err(format!(
                 "the statement is not read-only (it starts with {keyword:?}): {sample}\n\
-                 Only SELECT / EXPLAIN / SHOW / DESCRIBE / WITH / PRAGMA are allowed.\n\
-                 Turn on \"Allow write statements\" in Settings › Tools › MCP Server to run other statements."
+                 Only SELECT / EXPLAIN / SHOW / DESCRIBE / WITH / PRAGMA are allowed."
             ));
         }
     }
@@ -193,43 +187,37 @@ mod tests {
     use super::check;
     use ide_db::split::statements_in;
 
-    fn denied(sql: &str, allow_write: bool) -> bool {
+    fn denied(sql: &str) -> bool {
         let statements = statements_in(sql, 0, sql.encode_utf16().count() as u32, ide_db::DbDriver::Postgres);
-        check(&statements, allow_write).is_err()
+        check(&statements).is_err()
     }
 
     #[test]
     fn read_only_statements_pass() {
-        assert!(!denied("SELECT 1", false));
-        assert!(!denied("-- look up users\nWITH t AS (SELECT 1) SELECT * FROM t", false));
-        assert!(!denied("/* note */   explain SELECT 1", false));
-        assert!(!denied("show tables;", false));
-        assert!(!denied("PRAGMA foreign_keys;", false));
+        assert!(!denied("SELECT 1"));
+        assert!(!denied("-- look up users\nWITH t AS (SELECT 1) SELECT * FROM t"));
+        assert!(!denied("/* note */   explain SELECT 1"));
+        assert!(!denied("show tables;"));
+        assert!(!denied("PRAGMA foreign_keys;"));
     }
 
     #[test]
-    fn writes_are_denied_without_allow_write() {
-        assert!(denied("DELETE FROM t", false));
-        assert!(denied("UPDATE t SET x = 1", false));
-        assert!(denied("-- clean up\nDROP TABLE t", false));
-        assert!(denied("INSERT INTO t VALUES (1)", false));
-        assert!(denied("ALTER TABLE t ADD COLUMN c INT", false));
+    fn writes_are_denied() {
+        assert!(denied("DELETE FROM t"));
+        assert!(denied("UPDATE t SET x = 1"));
+        assert!(denied("-- clean up\nDROP TABLE t"));
+        assert!(denied("INSERT INTO t VALUES (1)"));
+        assert!(denied("ALTER TABLE t ADD COLUMN c INT"));
     }
 
     #[test]
     fn mixed_statements_are_denied() {
-        assert!(denied("SELECT 1; DELETE FROM t", false));
-    }
-
-    #[test]
-    fn allow_write_admits_everything() {
-        assert!(!denied("DELETE FROM t", true));
-        assert!(!denied("CREATE TABLE t (id INT)", true));
+        assert!(denied("SELECT 1; DELETE FROM t"));
     }
 
     #[test]
     fn comments_are_skipped() {
-        assert!(!denied("-- update the docs, really\nSELECT 1", false));
-        assert!(denied("/* SELECT */ DELETE FROM t", false));
+        assert!(!denied("-- update the docs, really\nSELECT 1"));
+        assert!(denied("/* SELECT */ DELETE FROM t"));
     }
 }

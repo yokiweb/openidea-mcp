@@ -20,7 +20,6 @@ import {
 import { useSettingsDialog } from "../model/staging";
 import type { PageSpec } from "./spec";
 import styles from "./McpServer.module.css";
-import { McpServerSettings } from "./mcp";
 
 /** `mcpServers` entry of an MCP client configuration (Claude Code, Cursor…). */
 export function httpConfig(status: McpServerStatus): string | null {
@@ -371,13 +370,6 @@ export const MCP_SERVER_PAGE: PageSpec = {
           ...WORKFLOW_LIMITS.agentArchiveLimit,
           integer: true,
           hint: "Beyond this many archived agent tabs, the oldest are closed.",
-        },
-        {
-          // 本地增量：`execute_query` 的 SQL 写权限开关（持久化在 `<config_dir>/mcp.json`）。
-          kind: "custom",
-          label: "Allow writing SQL",
-          keywords: ["allowWrite", "write", "SQL", "read-only"],
-          component: McpServerSettings,
         },
         {
           kind: "custom",
